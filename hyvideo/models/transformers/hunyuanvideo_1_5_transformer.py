@@ -796,6 +796,8 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
 
+        features_list = [] if output_features else None
+
         # Pass through double-stream blocks
         for index, block in enumerate(self.double_blocks):
             force_full_attn = (
@@ -818,13 +820,14 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
                 is_flash=force_full_attn,
                 block_idx=index,
             )
+            if output_features and index % output_features_stride == 0:
+                features_list.append(img)
 
         txt_seq_len = txt.shape[1]
         img_seq_len = img.shape[1]
 
         # Merge image and text for single-stream blocks
         x = torch.cat((img, txt), 1)
-        features_list = [] if output_features else None
         if len(self.single_blocks) > 0:
             for index, block in enumerate(self.single_blocks):
                 force_full_attn = (

@@ -140,8 +140,6 @@ class TrainingConfig:
     train_timestep_shift: float = 3.0
     validation_timestep_shift: float = 5.0
     snr_type: SNRType = SNRType.LOGNORM  # Timestep sampling strategy: uniform, lognorm, mix, or mode
-    feature_noise_scale: float = 0.1  # Scale noise level for feature transformer input (1.0 = same as main)
-    create_feature_transformer: bool = True  # Initialize feature transformer in pipeline
     
     # Task configuration
     task_type: str = "t2v"  # "t2v" or "i2v"
@@ -164,8 +162,6 @@ class TrainingConfig:
     
     # Device configuration
     dtype: str = "bf16"  # "bf16" or "fp32"
-    disable_text_conditioning: bool = False  # Skip text encoders and use dummy tokens to save GPU memory
-    disable_vae: bool = False  # Skip VAE and require latents in batch to save GPU memory
     
     # Seed
     seed: int = 42
@@ -432,9 +428,6 @@ class HunyuanVideoTrainer:
             enable_group_offloading=False,
             overlap_group_offloading=False,
             create_sr_pipeline=False,
-            create_feature_transformer=self.config.create_feature_transformer,
-            create_text_encoder=not self.config.disable_text_conditioning,
-            create_vae=not self.config.disable_vae,
             flow_shift=self.config.validation_timestep_shift,
             device=self.device,
         )
@@ -448,16 +441,8 @@ class HunyuanVideoTrainer:
             "byt5_model": self.pipeline.byt5_model,
             "byt5_tokenizer": self.pipeline.byt5_tokenizer,
         }
+        
         self.transformer.train()
-
-        self.feature_transformer = self.pipeline.feature_transformer
-        if self.feature_transformer is not None:
-            if self.is_main_process:
-                logger.info("Using feature transformer initialized in pipeline...")
-            self.feature_transformer.train()
-            self.feature_transformer.requires_grad_(False)
-        elif self.is_main_process:
-            logger.info("Feature transformer not created in pipeline; skipping.")
 
         if self.config.use_lora:
             self._apply_lora()
@@ -467,17 +452,12 @@ class HunyuanVideoTrainer:
         
         if self.config.enable_fsdp and self.world_size > 1:
             self._apply_fsdp()
-            self._apply_feature_fsdp()
         
         if self.is_main_process:
             logger.info(f"Models loaded. Transformer dtype: {transformer_dtype}")
             total_params = sum(p.numel() for p in self.transformer.parameters())
             trainable_params = sum(p.numel() for p in self.transformer.parameters() if p.requires_grad)
             logger.info(f"Transformer parameters: {total_params:,} (trainable: {trainable_params:,})")
-            if self.feature_transformer is not None:
-                total_params = sum(p.numel() for p in self.feature_transformer.parameters())
-                trainable_params = sum(p.numel() for p in self.feature_transformer.parameters() if p.requires_grad)
-                logger.info(f"Feature transformer parameters: {total_params:,} (trainable: {trainable_params:,})")
             logger.info(f"LoRA enabled: {self.config.use_lora}")
             logger.info(f"FSDP enabled: {self.config.enable_fsdp and self.world_size > 1}")
             logger.info(f"Gradient checkpointing enabled: {self.config.enable_gradient_checkpointing}")
@@ -516,7 +496,7 @@ class HunyuanVideoTrainer:
             total_params = sum(p.numel() for p in self.transformer.parameters())
             logger.info(f"LoRA applied successfully. Trainable parameters: {trainable_params:,} / {total_params:,} "
                        f"({100 * trainable_params / total_params:.2f}%)")
-
+    
     def _apply_fsdp(self):
         if self.is_main_process:
             logger.info("Applying FSDP2 to transformer...")
@@ -547,40 +527,6 @@ class HunyuanVideoTrainer:
         
         if self.is_main_process:
             logger.info("FSDP2 applied successfully")
-
-    def _apply_feature_fsdp(self):
-        if self.feature_transformer is None:
-            return
-        if self.is_main_process:
-            logger.info("Applying FSDP2 to feature transformer...")
-        
-        param_dtype = torch.bfloat16
-        reduce_dtype = torch.float32  # Reduce in float32 for stability
-
-        self.feature_transformer = self.feature_transformer.to(dtype=param_dtype)
-        
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype,
-            reduce_dtype=reduce_dtype,
-        )
-        
-        fsdp_config = {"mp_policy": mp_policy}
-        if self.world_size > 1:
-            try:
-                fsdp_config["mesh"] = get_parallel_state().fsdp_mesh
-            except Exception as e:
-                if self.is_main_process:
-                    logger.warning(f"Could not create DeviceMesh: {e}. FSDP will use process group instead.")
-        
-        for block in list(self.feature_transformer.double_blocks) + list(self.feature_transformer.single_blocks):
-            if block is not None:
-                fully_shard(block, **fsdp_config)
-        
-        fully_shard(self.feature_transformer, **fsdp_config)
-        self.feature_transformer.requires_grad_(False)
-        
-        if self.is_main_process:
-            logger.info("FSDP2 applied successfully to feature transformer")
     
     def _apply_gradient_checkpointing(self):
         if self.is_main_process:
@@ -648,34 +594,6 @@ class HunyuanVideoTrainer:
         
         if self.is_main_process:
             logger.info(f"Optimizer and scheduler initialized")
-
-    def _get_dummy_text_embeddings(self, batch_size: int):
-        text_dim = self.transformer.config.text_states_dim
-        if text_dim is None:
-            raise ValueError("text_states_dim is required to build dummy text tokens.")
-        text_len = 1
-        dtype = self.transformer.dtype if hasattr(self.transformer, "dtype") else next(self.transformer.parameters()).dtype
-        text_emb = torch.zeros((batch_size, text_len, text_dim), device=self.device, dtype=dtype)
-        text_mask = torch.ones((batch_size, text_len), device=self.device, dtype=torch.long)
-        text_emb_2 = None
-        text_mask_2 = None
-        text_dim_2 = self.transformer.config.text_states_dim_2
-        if text_dim_2 is not None:
-            text_emb_2 = torch.zeros((batch_size, text_len, text_dim_2), device=self.device, dtype=dtype)
-            text_mask_2 = torch.ones((batch_size, text_len), device=self.device, dtype=torch.long)
-        return text_emb, text_mask, text_emb_2, text_mask_2
-
-    def _get_dummy_byt5_embeddings(self, batch_size: int):
-        if not getattr(self.transformer, "glyph_byT5_v2", False):
-            return None, None
-        if not hasattr(self.transformer, "byt5_in"):
-            raise RuntimeError("glyph_byT5_v2 is enabled but byt5_in is missing on the transformer.")
-        byt5_dim = self.transformer.byt5_in.layernorm.normalized_shape[0]
-        byt5_len = 1
-        dtype = self.transformer.dtype if hasattr(self.transformer, "dtype") else next(self.transformer.parameters()).dtype
-        byt5_text_states = torch.zeros((batch_size, byt5_len, byt5_dim), device=self.device, dtype=dtype)
-        byt5_text_mask = torch.ones((batch_size, byt5_len), device=self.device, dtype=torch.long)
-        return byt5_text_states, byt5_text_mask
     
     def encode_text(self, prompts, data_type: str = "image"):
         text_inputs = self.text_encoder.text2tokens(prompts, data_type=data_type)
@@ -780,8 +698,6 @@ class HunyuanVideoTrainer:
         if 'latents' in batch:
             latents = batch['latents'].to(self.device)
         else:
-            if self.vae is None:
-                raise ValueError("VAE is disabled; provide `latents` in batch or re-enable VAE.")
             latents = self.encode_vae(pixel_values)
         
         if self.sp_enabled:
@@ -805,33 +721,28 @@ class HunyuanVideoTrainer:
         prompts = batch["text"]
         if self.sp_enabled:
             prompts = sync_tensor_for_sp(prompts, self.sp_group)
-        if self.config.disable_text_conditioning:
-            batch_size = latents.shape[0]
-            text_emb, text_mask, text_emb_2, text_mask_2 = self._get_dummy_text_embeddings(batch_size)
-            byt5_text_states, byt5_text_mask = self._get_dummy_byt5_embeddings(batch_size)
-        else:
-            text_emb, text_mask, text_emb_2, text_mask_2 = self.encode_text(prompts, data_type=data_type)
-            
-            byt5_text_states = None
-            byt5_text_mask = None
-            if self.byt5_kwargs["byt5_model"] is not None:
-                if "byt5_text_ids" in batch and batch["byt5_text_ids"] is not None:
-                    byt5_text_ids = batch["byt5_text_ids"].to(self.device)
-                    byt5_text_mask = batch["byt5_text_mask"].to(self.device)
-                    if self.sp_enabled:
-                        byt5_text_ids = sync_tensor_for_sp(byt5_text_ids, self.sp_group)
-                        byt5_text_mask = sync_tensor_for_sp(byt5_text_mask, self.sp_group)
-                    byt5_text_states, byt5_text_mask = self.encode_byt5(byt5_text_ids, byt5_text_mask)
-                else:
-                    byt5_embeddings_list = []
-                    byt5_mask_list = []
-                    for prompt in prompts:
-                        emb, mask = self.pipeline._process_single_byt5_prompt(prompt, self.device)
-                        byt5_embeddings_list.append(emb)
-                        byt5_mask_list.append(mask)
-                    
-                    byt5_text_states = torch.cat(byt5_embeddings_list, dim=0)
-                    byt5_text_mask = torch.cat(byt5_mask_list, dim=0)
+        text_emb, text_mask, text_emb_2, text_mask_2 = self.encode_text(prompts, data_type=data_type)
+        
+        byt5_text_states = None
+        byt5_text_mask = None
+        if self.byt5_kwargs["byt5_model"] is not None:
+            if "byt5_text_ids" in batch and batch["byt5_text_ids"] is not None:
+                byt5_text_ids = batch["byt5_text_ids"].to(self.device)
+                byt5_text_mask = batch["byt5_text_mask"].to(self.device)
+                if self.sp_enabled:
+                    byt5_text_ids = sync_tensor_for_sp(byt5_text_ids, self.sp_group)
+                    byt5_text_mask = sync_tensor_for_sp(byt5_text_mask, self.sp_group)
+                byt5_text_states, byt5_text_mask = self.encode_byt5(byt5_text_ids, byt5_text_mask)
+            else:
+                byt5_embeddings_list = []
+                byt5_mask_list = []
+                for prompt in prompts:
+                    emb, mask = self.pipeline._process_single_byt5_prompt(prompt, self.device)
+                    byt5_embeddings_list.append(emb)
+                    byt5_mask_list.append(mask)
+                
+                byt5_text_states = torch.cat(byt5_embeddings_list, dim=0)
+                byt5_text_mask = torch.cat(byt5_mask_list, dim=0)
         
         vision_states = None
         if task_type == "i2v":
@@ -853,7 +764,6 @@ class HunyuanVideoTrainer:
             target = sync_tensor_for_sp(target, self.sp_group)
         
         return {
-            "latents": latents,
             "latents_noised": latents_noised,
             "cond_latents": cond_latents,
             "timesteps": timesteps,
@@ -879,44 +789,6 @@ class HunyuanVideoTrainer:
             extra_kwargs["byt5_text_states"] = inputs["byt5_text_states"].to(dtype=model_dtype)
             extra_kwargs["byt5_text_mask"] = inputs["byt5_text_mask"]
         
-        if self.feature_transformer is not None:
-            with torch.no_grad():
-                # Match prepare_batch noise scheduling with a smaller timestep scale.
-                noise = torch.randn_like(inputs["latents"])
-                feature_timesteps = inputs["timesteps"] * self.config.feature_noise_scale
-                feature_latents_noised = self.noise_schedule.forward(inputs["latents"], noise, feature_timesteps)
-                feature_latents_input = torch.cat([feature_latents_noised, inputs["cond_latents"]], dim=1)
-
-                with torch.autocast(device_type="cuda", dtype=model_dtype, enabled=(model_dtype == torch.bfloat16)):
-                    _, feature_states = self.feature_transformer(
-                        feature_latents_input.to(dtype=model_dtype),
-                        feature_timesteps,
-                        text_states=inputs["text_emb"].to(dtype=model_dtype),
-                        text_states_2=inputs["text_emb_2"].to(dtype=model_dtype) if inputs["text_emb_2"] is not None else None,
-                        encoder_attention_mask=inputs["text_mask"].to(dtype=model_dtype),
-                        vision_states=inputs["vision_states"].to(dtype=model_dtype) if inputs["vision_states"] is not None else None,
-                        output_features=True,
-                        output_features_stride=4,
-                        mask_type=inputs["task_type"],
-                        extra_kwargs=extra_kwargs if extra_kwargs else None,
-                        return_dict=False,
-                    )
-                if feature_states is not None:
-                    patch_size = self.feature_transformer.patch_size
-                    tt = feature_latents_noised.shape[2] // patch_size[0]
-                    th = feature_latents_noised.shape[3] // patch_size[1]
-                    tw = feature_latents_noised.shape[4] // patch_size[2]
-                    feature_grid = feature_states.permute(1, 0, 2, 3).contiguous().view(
-                        feature_states.shape[1],
-                        feature_states.shape[0],
-                        tt,
-                        th,
-                        tw,
-                        feature_states.shape[-1],
-                    )
-                    self.feature_grid = feature_grid
-
-
         with torch.autocast(device_type="cuda", dtype=model_dtype, enabled=(model_dtype == torch.bfloat16)):
             model_pred = self.transformer(
                 latents_input.to(dtype=model_dtype),
@@ -1101,8 +973,6 @@ class HunyuanVideoTrainer:
             self.load_checkpoint(self.config.resume_from_checkpoint)
         
         self.transformer.train()
-        if self.feature_transformer is not None:
-            self.feature_transformer.train()
         
         while self.global_step < self.config.max_steps:
             for batch in dataloader:
@@ -1141,6 +1011,7 @@ class HunyuanVideoTrainer:
         """
         Implement your own validation logic here
         An example:
+
 
         logger.info(f"Running validation at step {step}...")
         
@@ -1294,16 +1165,6 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm")
     parser.add_argument("--train_timestep_shift", type=float, default=3.0, help="Train Timestep shift")
-    parser.add_argument(
-        "--feature_noise_scale", type=float, default=0.1,
-        help="Noise scale for feature transformer input (1.0 = same as main, 0.0 = clean latents)"
-    )
-    parser.add_argument(
-        "--create_feature_transformer", type=str_to_bool, nargs='?', const=True, default=True,
-        help="Create feature transformer in pipeline (default: true). "
-             "Use --create_feature_transformer or --create_feature_transformer true/1 to enable, "
-             "--create_feature_transformer false/0 to disable"
-    )
     parser.add_argument("--flow_snr_type", type=str, default="lognorm", 
                         choices=["uniform", "lognorm", "mix", "mode"],
                         help="SNR type for flow matching: uniform, lognorm, mix, or mode (default: lognorm)")
@@ -1319,10 +1180,6 @@ def main():
     
     # Other parameters
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"], help="Data type")
-    parser.add_argument("--disable_text_conditioning", type=str_to_bool, nargs='?', const=True, default=False,
-                        help="Disable text encoders and glyph ByT5, and use dummy masked tokens (default: false)")
-    parser.add_argument("--disable_vae", type=str_to_bool, nargs='?', const=True, default=False,
-                        help="Disable VAE and require latents in batches (default: false)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--i2v_prob", type=float, default=0.3, help="Probability of i2v task for video data (default: 0.3)")
     parser.add_argument("--use_muon", type=str_to_bool, nargs='?', const=True, default=True,
@@ -1395,8 +1252,6 @@ def main():
         save_interval=args.save_interval,
         log_interval=args.log_interval,
         dtype=args.dtype,
-        disable_text_conditioning=args.disable_text_conditioning,
-        disable_vae=args.disable_vae,
         seed=args.seed,
         i2v_prob=args.i2v_prob,
         enable_fsdp=args.enable_fsdp,
@@ -1407,8 +1262,6 @@ def main():
         validation_interval=args.validation_interval,
         validation_prompts=args.validation_prompts,
         train_timestep_shift=args.train_timestep_shift,
-        feature_noise_scale=args.feature_noise_scale,
-        create_feature_transformer=args.create_feature_transformer,
         validation_timestep_shift=args.validation_timestep_shift,
         snr_type=SNRType(args.flow_snr_type),
         validate_video_length=args.validate_video_length,
@@ -1428,3 +1281,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
