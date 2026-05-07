@@ -53,17 +53,26 @@ For detailed format requirements, see the docstring of `create_dummy_dataloader(
 """
 
 import os
+import gc
 import random
 import math
 import argparse
-from dataclasses import dataclass
-from typing import Dict, Any, List, Optional
+import sys
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Sequence, Tuple
 from enum import Enum
+import time
+import json
+import uuid
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.distributed.checkpoint as dcp
+from torch.utils.data import Subset
+from PIL import Image
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     get_optimizer_state_dict,
@@ -72,10 +81,12 @@ from diffusers.optimization import get_scheduler
 from loguru import logger
 import einops
 import imageio
+import wandb
+from filelock import FileLock
 
 from hyvideo.pipelines.hunyuan_video_pipeline import HunyuanVideo_1_5_Pipeline
 from hyvideo.commons.parallel_states import get_parallel_state, initialize_parallel_state
-from hyvideo.optim.muon import get_muon_optimizer
+from hyvideo.optim.muon import get_muon_optimizer, compute_average_gradnorm_by_group
 
 from torch.distributed._composable.fsdp import (
     MixedPrecisionPolicy,
@@ -120,6 +131,35 @@ def save_video(video: torch.Tensor, path: str):
     imageio.mimwrite(path, vid.cpu().numpy(), fps=24)
 
 
+def log_input_arguments(
+    output_dir: str,
+    argv: Optional[Sequence[str]] = None,
+    filename: str = "input_args.txt",
+) -> str:
+    """Append CLI arguments to output_dir/filename and return the file path."""
+    os.makedirs(output_dir, exist_ok=True)
+    args_path = os.path.join(output_dir, filename)
+    args = list(sys.argv if argv is None else argv)
+    if not args:
+        formatted_args = ""
+    else:
+        grouped_args = []
+        current_group = [args[0]]
+        for token in args[1:]:
+            if token.startswith("-") and token != "-":
+                grouped_args.append(current_group)
+                current_group = [token]
+            else:
+                current_group.append(token)
+        grouped_args.append(current_group)
+        formatted_args = " \\\n  ".join(
+            " ".join(token for token in group) for group in grouped_args
+        )
+    with open(args_path, "a", encoding="utf-8") as f:
+        f.write(f"{formatted_args}\n\n")
+    return args_path
+
+
 @dataclass
 class TrainingConfig:
     # Model paths
@@ -154,11 +194,18 @@ class TrainingConfig:
     # Data configuration
     batch_size: int = 1
     num_workers: int = 4
+    data_roots: Optional[List[str]] = None
+    validation_split_size: int = 0
+    video_length: Optional[int] = None  # Target video length (frames) for downstream augmentation
+    video_width: Optional[int] = None  # Target video width for downstream augmentation
+    video_height: Optional[int] = None  # Target video height for downstream augmentation
+    video_spatial_crop_margin: int = 40  # Extra resize margin used before random spatial crop
+    epochs_per_plan: int = 8
     
     # Output configuration
     output_dir: str = "./outputs"
     save_interval: int = 1000
-    log_interval: int = 10
+    log_interval: int = 1
     
     # Device configuration
     dtype: str = "bf16"  # "bf16" or "fp32"
@@ -170,6 +217,9 @@ class TrainingConfig:
     validation_interval: int = 100  # Run validation every N steps
     validation_prompts: Optional[List[str]] = None  # Prompts for validation (default: single prompt)
     validate_video_length: int = 121  # Video length (number of frames) for validation
+    validation_batch_size: int = 1  # Batch size for validation loss computation
+    validation_generation_size: int = 1  # Number of validation samples to generate per validation run
+    validation_target_resolution: str = "480p"  # Target resolution passed to pipeline during validation
     
     # Resume training configuration
     resume_from_checkpoint: Optional[str] = None  # Path to checkpoint directory to resume from
@@ -181,6 +231,19 @@ class TrainingConfig:
     lora_dropout: float = 0.0
     lora_target_modules: Optional[List[str]] = None  # Target modules for LoRA (default: all Linear layers)
     pretrained_lora_path: Optional[str] = None
+
+    # Latents cache / async encoding configuration
+    training_latents_cache_root: Optional[str] = None  # e.g. "dataset/training_latents_cache"
+    prebuilt_latents_cache_root: Optional[str] = None
+    latents_wait_timeout_s: float = 540.0
+    latents_poll_interval_s: float = 0.5
+
+    # WandB configuration
+    use_wandb: bool = True
+    wandb_project: str = "hunyuanvideo"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_tags: Optional[List[str]] = None
 
 
 class LinearInterpolationSchedule:
@@ -392,11 +455,15 @@ class HunyuanVideoTrainer:
             snr_type=config.snr_type,
         )
         
-        self.global_step = 0
+        self.global_step = 0  # Optimizer update steps
+        self.micro_step = 0  # Dataloader / accumulation steps
         self.current_epoch = 0
+        self._wandb_run_id = None
         
         if self.is_main_process:
             os.makedirs(config.output_dir, exist_ok=True)
+            args_path = log_input_arguments(config.output_dir)
+            logger.info(f"Input arguments appended to {args_path}")
         
         self.validation_output_dir = os.path.join(config.output_dir, "samples")
         if self.is_main_process:
@@ -404,6 +471,32 @@ class HunyuanVideoTrainer:
         
         if config.validation_prompts is None:
             config.validation_prompts = ["A beautiful sunset over the ocean with waves gently crashing on the shore"]
+
+        # --- wandb init (rank0 only, initialized in train() after checkpoint load) ---
+        self._wandb_run = None
+
+    def _init_wandb(self):
+        if not (self.is_main_process and getattr(self.config, "use_wandb", False)):
+            return
+        if self._wandb_run is not None:
+            return
+
+        wandb_init_kwargs = dict(
+            project=self.config.wandb_project,
+            entity=self.config.wandb_entity,
+            name=self.config.wandb_run_name,
+            tags=self.config.wandb_tags,
+            dir=self.config.output_dir,
+            config=asdict(self.config),
+        )
+        if self._wandb_run_id:
+            wandb_init_kwargs["id"] = self._wandb_run_id
+            wandb_init_kwargs["resume"] = "allow"
+            logger.info(f"Resuming wandb run id={self._wandb_run_id} at step {self.global_step}")
+
+        self._wandb_run = wandb.init(**wandb_init_kwargs)
+        if self._wandb_run is not None:
+            self._wandb_run_id = self._wandb_run.id
     
     def _set_seed(self, seed: int):
         random.seed(seed)
@@ -586,10 +679,10 @@ class HunyuanVideoTrainer:
             )
         
         self.lr_scheduler = get_scheduler(
-            "constant",
+            "constant_with_warmup",
             optimizer=self.optimizer,
-            num_warmup_steps=self.config.warmup_steps * self.world_size,
-            num_training_steps=self.config.max_steps * self.world_size,
+            num_warmup_steps=self.config.warmup_steps,
+            num_training_steps=self.config.max_steps,
         )
         
         if self.is_main_process:
@@ -622,26 +715,78 @@ class HunyuanVideoTrainer:
         """Encode images to vision states (for i2v)"""
         if self.vision_encoder is None:
             return None
-        assert images.max() <= 1.0 and images.min() >= -1.0, f"Images must be in the range [-1, 1], but got {images.min()} {images.max()}"
+        if images.max() > 1.0 or images.min() < -1.0:
+            logger.warning(f"Images out of [-1, 1] in encode_images: {images.min()} {images.max()}; clamping")
+        images = images.clamp(-1.0, 1.0)
         images = (images + 1) / 2 # [-1, 1] -> [0, 1]
         images_np = (images.cpu().permute(0, 2, 3, 1).numpy() * 255).clip(0, 255).astype("uint8")
         vision_states = self.vision_encoder.encode_images(images_np)
         return vision_states.last_hidden_state.to(device=self.device, dtype=self.transformer.dtype)
     
-    def encode_vae(self, images: torch.Tensor) -> torch.Tensor:
+    def encode_vae(self, images: torch.Tensor, enable_sp_distributed_encode: bool = True) -> torch.Tensor:
         if images.max() > 1.0 or images.min() < -1.0:
-            raise ValueError(f"Images must be in the range [-1, 1], but got {images.min()} {images.max()}")
+            logger.warning(f"Images out of [-1, 1] in encode_vae: {images.min()} {images.max()}; clamping")
+        images = images.clamp(-1.0, 1.0)
         
         if images.ndim == 4:
             images = images.unsqueeze(2)
-        
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16), self.vae.memory_efficient_context():
-            latents = self.vae.encode(images).latent_dist.sample()
-            if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
-                latents = (latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-            else:
-                latents = latents * self.vae.config.scaling_factor
-        
+
+        def _encode(local_images: torch.Tensor) -> torch.Tensor:
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16), self.vae.memory_efficient_context():
+                local_latents = self.vae.encode(local_images).latent_dist.sample()
+                if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
+                    local_latents = (local_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+                else:
+                    local_latents = local_latents * self.vae.config.scaling_factor
+            return local_latents
+
+        parallel_state = getattr(self, "parallel_state", None)
+        use_sp_distributed_encode = (
+            enable_sp_distributed_encode
+            and parallel_state is not None
+            and parallel_state.sp_enabled
+            and parallel_state.sp_group is not None
+            and dist.is_available()
+            and dist.is_initialized()
+        )
+        if not use_sp_distributed_encode:
+            return _encode(images)
+
+        sp_group = parallel_state.sp_group
+        sp_size = int(parallel_state.sp)
+        sp_rank = int(parallel_state.sp_rank)
+        if sp_size <= 1:
+            return _encode(images)
+
+        src_rank = dist.get_global_rank(sp_group, 0)
+        shape_obj = [tuple(images.shape) if sp_rank == 0 else None]
+        dist.broadcast_object_list(shape_obj, src=src_rank, group=sp_group)
+        global_shape = tuple(shape_obj[0])
+        global_batch = int(global_shape[0])
+
+        if global_batch % sp_size != 0:
+            if sp_rank == 0:
+                logger.warning(
+                    f"SP distributed VAE encode disabled: batch size {global_batch} is not divisible by sp_size {sp_size}. "
+                    "Falling back to local VAE encode."
+                )
+            return _encode(images)
+
+        local_batch = global_batch // sp_size
+        local_images = torch.empty(
+            (local_batch, *global_shape[1:]),
+            dtype=images.dtype,
+            device=images.device,
+        )
+        scatter_list = None
+        if sp_rank == 0:
+            scatter_list = [chunk.contiguous() for chunk in torch.chunk(images.contiguous(), sp_size, dim=0)]
+        dist.scatter(local_images, scatter_list=scatter_list, src=src_rank, group=sp_group)
+
+        local_latents = _encode(local_images).contiguous()
+        gathered_latents = [torch.empty_like(local_latents) for _ in range(sp_size)]
+        dist.all_gather(gathered_latents, local_latents, group=sp_group)
+        latents = torch.cat(gathered_latents, dim=0).contiguous()
         return latents
     
     def get_condition(self, latents: torch.Tensor, task_type: str) -> torch.Tensor:
@@ -706,6 +851,8 @@ class HunyuanVideoTrainer:
                 pixel_values = sync_tensor_for_sp(pixel_values, self.sp_group)
         
         data_type_raw = batch.get("data_type", "image")
+        if self.sp_enabled:
+            data_type_raw = sync_tensor_for_sp(data_type_raw, self.sp_group)
         if isinstance(data_type_raw, list):
             data_type = data_type_raw[0]
         elif isinstance(data_type_raw, str):
@@ -756,6 +903,10 @@ class HunyuanVideoTrainer:
         noise = torch.randn_like(latents)
         timesteps = self.timestep_sampler.sample(latents.shape[0], device=self.device)
         timesteps = timestep_transform(timesteps, self.config.num_train_timesteps, self.config.train_timestep_shift)
+
+        if self.sp_enabled:
+            noise = sync_tensor_for_sp(noise, self.sp_group)
+            timesteps = sync_tensor_for_sp(timesteps, self.sp_group)
         
         latents_noised = self.noise_schedule.forward(latents, noise, timesteps)
         target = noise - latents
@@ -805,10 +956,24 @@ class HunyuanVideoTrainer:
         target = inputs["target"].to(dtype=model_pred.dtype)
         loss = nn.functional.mse_loss(model_pred, target)
         
-        loss = loss / self.config.gradient_accumulation_steps
+        accum = self.config.gradient_accumulation_steps
+        loss = loss / accum
         loss.backward()
-        
-        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+
+        do_update = ((self.micro_step + 1) % accum == 0)
+        gradnorm_group_metrics = {}
+
+        if do_update:
+            prefix_groups = {
+                "gradnorm_double_blocks": ["double_blocks."],
+                "gradnorm_final_layer": ["final_layer."],
+            }
+            gradnorm_group_metrics = compute_average_gradnorm_by_group(
+                self.transformer,
+                prefix_groups=prefix_groups,
+                substring_groups={},
+                require_grad_only=True,
+            )
             if self.config.max_grad_norm > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.transformer.parameters(),
@@ -820,20 +985,33 @@ class HunyuanVideoTrainer:
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
+            self.global_step += 1
         else:
             grad_norm = torch.tensor(0.0)
-        
+
+        self.micro_step += 1
+
         metrics = {
             "loss": loss.item() * self.config.gradient_accumulation_steps,
             "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
             "lr": self.lr_scheduler.get_last_lr()[0] if hasattr(self.lr_scheduler, "get_last_lr") else self.config.learning_rate,
+            "did_update": 1.0 if do_update else 0.0,
         }
+        metrics.update(gradnorm_group_metrics)
         
         return metrics
+
+    def _pre_checkpoint_cleanup(self):
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     
     def save_checkpoint(self, step: int):
         checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{step}")
         transformer_dir = os.path.join(checkpoint_dir, "transformer")
+
+        self._pre_checkpoint_cleanup()
         
         if self.is_main_process:
             os.makedirs(checkpoint_dir, exist_ok=True)
@@ -886,7 +1064,9 @@ class HunyuanVideoTrainer:
             training_state_path = os.path.join(checkpoint_dir, "training_state.pt")
             torch.save({
                 "lr_scheduler": self.lr_scheduler.state_dict(),
-                "global_step": step,
+                "global_step": self.global_step,
+                "micro_step": self.micro_step,
+                "wandb_run_id": self._wandb_run_id,
             }, training_state_path)
         
         if self.world_size > 1:
@@ -946,15 +1126,19 @@ class HunyuanVideoTrainer:
                 training_state = torch.load(training_state_path, map_location=self.device)
                 self.lr_scheduler.load_state_dict(training_state["lr_scheduler"])
                 self.global_step = training_state.get("global_step", 0)
+                self.micro_step = training_state.get("micro_step", 0)
+                self._wandb_run_id = training_state.get("wandb_run_id")
                 logger.info(f"Training state loaded: global_step={self.global_step}")
             else:
-                # Non-main processes will get global_step via broadcast
+                # Non-main processes will get global_step/micro_step via broadcast
                 self.global_step = 0
+                self.micro_step = 0
         
         if self.world_size > 1:
-            global_step_tensor = torch.tensor(self.global_step, device=self.device)
-            dist.broadcast(global_step_tensor, src=0)
-            self.global_step = global_step_tensor.item()
+            t = torch.tensor([self.global_step, self.micro_step], device=self.device, dtype=torch.long)
+            dist.broadcast(t, src=0)
+            self.global_step = int(t[0].item())
+            self.micro_step = int(t[1].item())
         
         if self.world_size > 1:
             dist.barrier()
@@ -962,7 +1146,7 @@ class HunyuanVideoTrainer:
         if self.is_main_process:
             logger.info(f"Checkpoint loaded successfully. Resuming from step {self.global_step}")
     
-    def train(self, dataloader):
+    def train(self, train_dataset, validation_dataset=None):
         if self.is_main_process:
             logger.info("Starting training...")
             logger.info(f"Max steps: {self.config.max_steps}")
@@ -971,94 +1155,544 @@ class HunyuanVideoTrainer:
         
         if self.config.resume_from_checkpoint is not None:
             self.load_checkpoint(self.config.resume_from_checkpoint)
+
+        self._init_wandb()
         
         self.transformer.train()
-        
+
+        prebuilt_cache_root = getattr(self.config, "prebuilt_latents_cache_root", None)
+        use_prebuilt_cache = prebuilt_cache_root is not None
+        cache_root = Path(prebuilt_cache_root) if use_prebuilt_cache else Path(self.config.training_latents_cache_root)
+
+        epochs_per_plan = int(self.config.epochs_per_plan)
+        plan_num_batches = (epochs_per_plan * len(train_dataset)) // int(self.config.batch_size)
+        steps_per_epoch = plan_num_batches / float(epochs_per_plan)
+        load_real_data = (not self.sp_enabled) or (self.parallel_state.sp_rank == 0)
+
         while self.global_step < self.config.max_steps:
+
+            epoch_float = float(self.micro_step) / steps_per_epoch
+            logical_epoch = int(math.floor(epoch_float + 1e-12))
+
+            block_start_epoch = (logical_epoch // epochs_per_plan) * epochs_per_plan
+            next_block_epoch = block_start_epoch + epochs_per_plan
+
+            # Build current block + next block so encoders stay one block ahead
+            if load_real_data:
+                if use_prebuilt_cache:
+                    plan_path = cache_root / "plans" / f"epoch_{int(block_start_epoch):06d}.json"
+                    if not plan_path.exists():
+                        raise FileNotFoundError(
+                            f"Prebuilt cache plan not found: {plan_path}. "
+                            f"Either provide a cache with this plan, or unset prebuilt_latents_cache_root."
+                        )
+                    with plan_path.open("r", encoding="utf-8") as f:
+                        plan = json.load(f)
+                else:
+                    plan = self.build_epoch_plan_and_requests(
+                        epoch=block_start_epoch,
+                        dataset=train_dataset,
+                        cache_root=cache_root,
+                        epochs_per_plan=epochs_per_plan,
+                    )
+                    self.build_epoch_plan_and_requests(
+                        epoch=next_block_epoch,
+                        dataset=train_dataset,
+                        cache_root=cache_root,
+                        epochs_per_plan=epochs_per_plan,
+                    )
+            else:
+                plan = None
+
+            # if self.world_size > 1:
+            #     dist.barrier()
+
+            if self.sp_enabled:
+                plan = sync_tensor_for_sp(plan, self.sp_group)
+
+            plan_ds = PlanDataset(train_dataset, plan, cache_root=cache_root, load_real_data=load_real_data, config=self.config)
+
+            if (not self.sp_enabled) or (self.parallel_state.sp_rank == 0):
+                dataloader = torch.utils.data.DataLoader(
+                    plan_ds,
+                    batch_size=self.config.batch_size,
+                    shuffle=False,
+                    num_workers=self.config.num_workers,
+                    persistent_workers=self.config.num_workers > 0,
+                    pin_memory=True,
+                    prefetch_factor=1 if self.config.num_workers > 0 else None,
+                    drop_last=True,
+                )
+            else:
+                dataloader = torch.utils.data.DataLoader(
+                    plan_ds,
+                    batch_size=self.config.batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                    persistent_workers=False,
+                    drop_last=True,
+                )
+
+            if len(dataloader) != plan_num_batches and self.is_main_process:
+                raise RuntimeError(
+                    f"Mismatch in expected plan batches: len(dataloader)={len(dataloader)} "
+                    f"vs plan_num_batches={plan_num_batches} (epochs_per_plan={epochs_per_plan})."
+                )
             for batch in dataloader:
                 if self.global_step >= self.config.max_steps:
                     break
 
                 metrics = self.train_step(batch)
                 
-                if self.global_step % self.config.log_interval == 0 and self.is_main_process:
-                    logger.info(
-                        f"Step {self.global_step}/{self.config.max_steps} | "
-                        f"Loss: {metrics['loss']:.6f} | "
-                        f"Grad Norm: {metrics['grad_norm']:.4f} | "
-                        f"LR: {metrics['lr']:.2e}"
-                    )
-                
-                if self.global_step >= 0 and self.global_step % self.config.validation_interval == 0:
-                    self.validate(self.global_step)
-                
-                if (self.global_step + 1) % self.config.save_interval == 0:
-                    self.save_checkpoint(self.global_step + 1)
-                    if self.world_size > 1:
-                        dist.barrier()
-                
-                self.global_step += 1
+                if metrics.get("did_update", 0.0) > 0.0:
+                    if self.global_step % self.config.log_interval == 0 and self.is_main_process:
+                        epoch_float = self.micro_step / steps_per_epoch
+                        epoch_int = int(math.floor(epoch_float + 1e-12))
+                        logger.info(
+                            f"Step {self.global_step}/{self.config.max_steps} | "
+                            f"Loss: {metrics['loss']:.6f} | "
+                            f"Grad Norm: {metrics['grad_norm']:.4f} | "
+                            f"DB GN: {metrics.get('gradnorm_double_blocks', 0.0):.4f} | "
+                            f"FL GN: {metrics.get('gradnorm_final_layer', 0.0):.4f} | "
+                            f"LR: {metrics['lr']:.2e} | "
+                            f"Epoch: {epoch_float:.4f}"
+                        )
+                        
+                        if self._wandb_run is not None:
+                            wandb.log(
+                                {**metrics, "epoch": epoch_float, "epoch_int": epoch_int},
+                                step=self.global_step,
+                            )
+                    
+                    if self.global_step >= 0 and self.global_step % self.config.validation_interval == 0:
+                        self.validate(self.global_step, validation_dataset)
+                    
+                    if self.global_step % self.config.save_interval == 0:
+                        self.save_checkpoint(self.global_step)
+                        if self.world_size > 1:
+                            dist.barrier()
         
         if self.is_main_process:
             self.save_checkpoint(self.global_step)
             logger.info("Training completed!")
+            if self._wandb_run is not None:
+                wandb.finish()
         
         if self.world_size > 1:
             dist.barrier()
             dist.destroy_process_group()
     
-    def validate(self, step: int):
-        """
-        Implement your own validation logic here
-        An example:
+    def validate(self, step: int, val_dataset=None):
+        if val_dataset is None:
+            return
 
+        if val_dataset is None or len(val_dataset) == 0:
+            logger.warning("Validation dataset is empty. Skipping validation.")
+            return
 
-        logger.info(f"Running validation at step {step}...")
-        
         self.transformer.eval()
-        
+
         try:
-            for idx, prompt in enumerate(self.config.validation_prompts):
-                logger.info(f"Generating validation video {idx+1}/{len(self.config.validation_prompts)}: {prompt[:50]}...")
-                
+            # Compute validation loss over all validation samples using the
+            # same forward/loss computation as training (without updates).
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=max(1, int(self.config.validation_batch_size)),
+                shuffle=False,
+                num_workers=8,
+                persistent_workers=False,
+                pin_memory=False,
+                prefetch_factor=1,
+            )
+
+            model_dtype = torch.bfloat16 if self.config.dtype == "bf16" else torch.float32
+            weighted_loss_sum = 0.0
+            sample_count = 0
+
+            with torch.no_grad():
+                for val_batch in val_dataloader:
+                    inputs = self.prepare_batch(val_batch)
+                    latents_input = torch.cat([inputs["latents_noised"], inputs["cond_latents"]], dim=1)
+
+                    extra_kwargs = {}
+                    if inputs["byt5_text_states"] is not None:
+                        extra_kwargs["byt5_text_states"] = inputs["byt5_text_states"].to(dtype=model_dtype)
+                        extra_kwargs["byt5_text_mask"] = inputs["byt5_text_mask"]
+
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=model_dtype,
+                        enabled=(model_dtype == torch.bfloat16),
+                    ):
+                        model_pred = self.transformer(
+                            latents_input.to(dtype=model_dtype),
+                            inputs["timesteps"],
+                            text_states=inputs["text_emb"].to(dtype=model_dtype),
+                            text_states_2=inputs["text_emb_2"].to(dtype=model_dtype) if inputs["text_emb_2"] is not None else None,
+                            encoder_attention_mask=inputs["text_mask"].to(dtype=model_dtype),
+                            vision_states=inputs["vision_states"].to(dtype=model_dtype) if inputs["vision_states"] is not None else None,
+                            mask_type=inputs["task_type"],
+                            extra_kwargs=extra_kwargs if extra_kwargs else None,
+                            return_dict=False,
+                        )[0]
+
+                    target = inputs["target"].to(dtype=model_pred.dtype)
+                    loss = nn.functional.mse_loss(model_pred, target)
+
+                    batch_size = int(target.shape[0])
+                    weighted_loss_sum += float(loss.item()) * batch_size
+                    sample_count += batch_size
+
+            if sample_count > 0:
+                val_loss = weighted_loss_sum / float(sample_count)
+                if self.is_main_process:
+                    logger.info(
+                        f"Validation step {step} | "
+                        f"Val Loss: {val_loss:.6f} | "
+                        f"Samples: {sample_count}"
+                    )
+                    if self._wandb_run is not None:
+                        wandb.log(
+                            {
+                                "validation/loss": val_loss,
+                                "validation/num_samples": sample_count,
+                            },
+                            step=step,
+                        )
+            else:
+                logger.warning("Validation dataloader produced zero samples; skipping validation loss logging.")
+
+            # Deterministic rank-independent sample selection that advances every validation round.
+            validation_round = step // max(1, self.config.validation_interval)
+            validation_generation_size = max(1, int(self.config.validation_generation_size))
+            base_idx = (validation_round * validation_generation_size) % len(val_dataset)
+            sample_indices = [
+                (base_idx + batch_idx) % len(val_dataset)
+                for batch_idx in range(validation_generation_size)
+            ]
+
+            if self.is_main_process:
+                os.makedirs(self.validation_output_dir, exist_ok=True)
+
+            wandb_generated_videos = []
+            for batch_idx, sample_idx in enumerate(sample_indices):
+                sample = val_dataset[sample_idx]
+
+                prompt = sample.get("text", self.config.validation_prompts[0])
+                if not isinstance(prompt, str):
+                    prompt = str(prompt)
+
+                pixel_values = sample.get("pixel_values")
+                if pixel_values is None:
+                    logger.warning(f"Validation sample {sample_idx} has no pixel_values. Skipping.")
+                    continue
+
+                # Always run validation generation as i2v.
+                if pixel_values.ndim == 4:  # [C, F, H, W]
+                    first_frame = pixel_values[:, 0]
+                    original_video = pixel_values
+                elif pixel_values.ndim == 3:  # [C, H, W]
+                    first_frame = pixel_values
+                    original_video = pixel_values.unsqueeze(1)
+                else:
+                    logger.warning(
+                        f"Validation sample {sample_idx} has unexpected pixel_values shape: {tuple(pixel_values.shape)}"
+                    )
+                    continue
+
+                height = int(first_frame.shape[-2])
+                width = int(first_frame.shape[-1])
+                aspect_ratio = f"{width}:{height}"
+                generation_kwargs = {}
+                generation_kwargs["target_resolution"] = self.config.validation_target_resolution
+
+                frame = first_frame.detach().cpu().clamp(-1, 1)
+                frame = ((frame + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
+                reference_image = Image.fromarray(frame)
+
+                seed = self.config.seed
+                video_length = self.config.validate_video_length
+
+                if self.sp_enabled:
+                    prompt = sync_tensor_for_sp(prompt, self.sp_group)
+                    aspect_ratio = sync_tensor_for_sp(aspect_ratio, self.sp_group)
+                    reference_image = sync_tensor_for_sp(reference_image, self.sp_group)  # PIL.Image (broadcast as object)
+                    generation_kwargs = sync_tensor_for_sp(generation_kwargs, self.sp_group)  # dict
+                    seed = sync_tensor_for_sp(seed, self.sp_group)
+                    video_length = sync_tensor_for_sp(video_length, self.sp_group)
+
                 with torch.no_grad():
                     output = self.pipeline(
                         prompt=prompt,
-                        aspect_ratio="16:9",
-                        video_length=self.config.validate_video_length,
-                        enable_sr=False,  # Disable SR for faster validation
-                        prompt_rewrite=False,  # Disable prompt rewrite for faster validation
-                        output_type="pt",
-                        seed=42,
+                        aspect_ratio=aspect_ratio,
+                        reference_image=reference_image,
+                        video_length=video_length,
+                        enable_sr=False,
+                        prompt_rewrite=False,
+                        seed=seed,
+                        enable_vae_tile_parallelism=True,
+                        **generation_kwargs,
                     )
-                    
+
+                if self.is_main_process:
+                    original_video = ((original_video.detach().cpu().float().clamp(-1, 1) + 1.0) * 0.5).clamp(0, 1)
+                    generated_video = output.videos[0].detach().cpu().float().clamp(0, 1)
+
+                    side_by_side_video = torch.cat([original_video, generated_video], dim=-1)
                     video_path = os.path.join(
                         self.validation_output_dir,
-                        f"step_{step:06d}_prompt_{idx:02d}.mp4"
+                        f"step_{step:06d}_sample_{sample_idx:06d}_b{batch_idx:02d}.mp4",
                     )
-                    print(f"Prompt: {prompt}")
-                    video_to_save = output.videos
-                    if dist.get_rank() == 0:
-                        save_video(video_to_save, video_path)
-                        logger.info(f"Validation video saved to {video_path}")
-        
+                    save_video(side_by_side_video, video_path)
+                    logger.info(f"Validation i2v video saved to {video_path}")
+
+                    if self._wandb_run is not None:
+                        prompt_caption = prompt if len(prompt) <= 180 else f"{prompt[:177]}..."
+                        wandb_generated_videos.append(
+                            wandb.Video(
+                                video_path,
+                                fps=24,
+                                format="mp4",
+                                caption=f"sample_idx={sample_idx} | prompt={prompt_caption}",
+                            )
+                        )
+
+            if self.is_main_process and self._wandb_run is not None and wandb_generated_videos:
+                wandb.log({"validation/generated_videos": wandb_generated_videos}, step=step)
+
         except Exception as e:
             logger.error(f"Error during validation: {e}")
             import traceback
             logger.error(traceback.format_exc())
-        
+
         finally:
             self.transformer.train()
-        pass
+
+    def build_epoch_plan_and_requests(
+        self,
+        epoch: int,
+        dataset,                 # must have samples list or a way to map idx -> paths
+        cache_root: Path,
+        epochs_per_plan: int = 1,
+    ):
         """
+        Rank0 only. Create/reuse one plan and one request file.
+        If epochs_per_plan>1, the plan contains multiple logical epochs worth of entries.
+        """
+        plans_dir = cache_root / "plans"
+        req_dir = cache_root / "requests"
+        lock_dir = cache_root / "locks"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        req_dir.mkdir(parents=True, exist_ok=True)
+        lock_dir.mkdir(parents=True, exist_ok=True)
 
+        plan_path = plans_dir / f"epoch_{epoch:06d}.json"
+        req_path  = req_dir   / f"epoch_{epoch:06d}.jsonl"
+        
+        epoch_plan_lock = FileLock(str(cache_root / "locks" / "epoch_plan.lock"))
+        with epoch_plan_lock:
+            # if already exists, just reuse (useful for resume/restart in same epoch)
+            if plan_path.exists() and req_path.exists():
+                plan = json.loads(plan_path.read_text("utf-8"))
+                return plan
 
-def create_dummy_dataloader(config: TrainingConfig):
+            if isinstance(dataset, Subset):
+                base_ds = dataset.dataset
+                idxs = list(dataset.indices)   # original indices
+            else:
+                base_ds = dataset
+                idxs = list(range(len(base_ds)))
+
+            n = len(idxs)
+            if n <= 0:
+                raise ValueError("Cannot build epoch plan for empty dataset.")
+
+            epochs_per_plan = int(max(1, epochs_per_plan))
+            plan_entries = []
+
+            for e_off in range(epochs_per_plan):
+                logical_epoch = int(epoch) + int(e_off)
+
+                g = torch.Generator().manual_seed(int(self.config.seed) + logical_epoch)
+                perm = torch.randperm(n, generator=g).tolist()
+                sample_seeds = torch.randint(
+                    low=0,
+                    high=2**32 - 1,
+                    size=(n,),
+                    generator=g,
+                    dtype=torch.int64,
+                ).tolist()
+
+                for k, perm_idx in enumerate(perm):
+                    base_idx = int(idxs[perm_idx])
+                    root_path, video_path, text_path = base_ds.samples[base_idx]
+                    job_id = f"e{logical_epoch}_{video_path.stem}_{time.time_ns()}_{uuid.uuid4().hex[:8]}"
+
+                    plan_entries.append({
+                        "dataset_index": int(base_idx),
+                        "job_id": job_id,
+                        "root_path": str(root_path),
+                        "video_path": str(video_path),
+                        "text_path": str(text_path),
+                        "aug_seed": int(sample_seeds[k]),
+                    })
+
+            plan = {
+                "epoch": int(epoch),
+                "epochs_per_plan": epochs_per_plan,
+                "num_samples_per_epoch": n,
+                "num_samples": len(plan_entries),
+                "entries": plan_entries,
+            }
+
+            # Write plan atomically
+            tmp = plan_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(plan), encoding="utf-8")
+            os.replace(tmp, plan_path)
+
+            # Write a single request file for encoders (JSONL)
+            # Each line is an independent job payload.
+            tmp_req = req_path.with_suffix(".jsonl.tmp")
+            with tmp_req.open("w", encoding="utf-8") as f:
+                for e in plan_entries:
+                    payload = {
+                        "epoch": int(epoch),
+                        "job_id": e["job_id"],
+                        "root_path": e["root_path"],
+                        "video_path": e["video_path"],
+                        "text_path": e["text_path"],
+                        "aug_seed": e["aug_seed"],
+                        "video_length": int(self.config.video_length),
+                        "video_width": int(self.config.video_width),
+                        "video_height": int(self.config.video_height),
+                        "video_spatial_crop_margin": int(self.config.video_spatial_crop_margin),
+                    }
+                    f.write(json.dumps(payload) + "\n")
+            os.replace(tmp_req, req_path)
+
+        return plan
+
+class PlanDataset(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, plan: dict, cache_root: Path, load_real_data: bool, config: TrainingConfig):
+        if isinstance(base_dataset, Subset):
+            base_dataset = base_dataset.dataset  # unwrap
+
+        self.base = base_dataset
+        self.plan = plan
+        self.entries = plan["entries"]
+        self.cache_root = cache_root
+        self.load_real_data = load_real_data
+        self.epoch = int(plan["epoch"])
+        self.video_width = int(config.video_width)
+        self.video_height = int(config.video_height)
+        self.crop_margin = int(config.video_spatial_crop_margin)
+
+        self.latents_wait_timeout_s = config.latents_wait_timeout_s
+        self.latents_poll_interval_s = config.latents_poll_interval_s
+        (self.cache_root / "locks").mkdir(parents=True, exist_ok=True)
+        self.latents_lock = FileLock(str(self.cache_root / "locks" / f"latents.lock"))
+
+    def __len__(self):
+        return len(self.entries)
+
+    def _wait_and_load_latents(self, lat_path: Path) -> Tuple[torch.Tensor, Dict[str, Any]]:
+
+        start = time.time()
+        last_err = None
+
+        while True:
+            if (time.time() - start) > self.latents_wait_timeout_s:
+                msg = (
+                    f"Timed out waiting for latents: {lat_path} "
+                )
+                if last_err is not None:
+                    msg += f" | last torch.load error: {repr(last_err)}"
+                raise TimeoutError(msg)
+
+            if not lat_path.exists():
+                time.sleep(self.latents_poll_interval_s)
+                continue
+
+            try:
+                with self.latents_lock:
+                    loaded = torch.load(lat_path, map_location="cpu")
+
+                    if not isinstance(loaded, dict):
+                        raise TypeError(
+                            f"Expected latent payload to be Tensor or dict, got {type(loaded).__name__}"
+                        )
+
+                    latents = loaded.get("latents")
+                    if not torch.is_tensor(latents):
+                        raise TypeError(
+                            f"Expected key 'latents' in payload to be a Tensor, got {type(latents).__name__}"
+                        )
+
+                    augmentation = loaded.get("augmentation")
+                    if not isinstance(augmentation, dict):
+                        raise TypeError(
+                            f"Expected key 'augmentation' in payload to be a dict, got {type(augmentation).__name__}"
+                        )
+
+                    return latents.to(torch.float32), augmentation
+            except Exception as e:
+                last_err = e
+                time.sleep(self.latents_poll_interval_s)
+
+    def __getitem__(self, plan_idx: int):
+
+        if not self.load_real_data:
+            return {
+                "pixel_values": torch.zeros(3, 5, 16, 16, dtype=torch.float32),
+                "latents": torch.zeros(32, 2, 1, 1, dtype=torch.float32),
+                "text": "",
+                "data_type": "video",
+                "job_id": "dummy_id",
+            }
+
+        e = self.entries[plan_idx]
+
+        # Load latents produced by encoder for this plan entry
+        video_path = Path(e["video_path"])
+        text_path = Path(e["text_path"])
+        lat_path = self.cache_root / "latents" / f"epoch_{self.epoch:06d}" / f"{e['job_id']}.pt"
+        try:
+            latents, augmentation = self._wait_and_load_latents(lat_path)
+        except Exception as ex:
+            if plan_idx != 0:
+                print(f"[PlanDataset] Latents load failed for idx={plan_idx} ({lat_path}); fallback to idx=0. Error: {repr(ex)}")
+                return self.__getitem__(0)
+            raise
+
+        start_frame_idx = int(augmentation["start_frame_idx"])
+        num_frames = int(augmentation["num_frames"])
+        crop_x = int(augmentation["crop_x"])
+        crop_y = int(augmentation["crop_y"])
+        pixel_values = self.base.load_video(
+            video_path,
+            start_frame_idx=start_frame_idx,
+            num_frames=num_frames,
+            target_width=self.video_width,
+            target_height=self.video_height,
+            crop_margin=self.crop_margin,
+            crop_x=crop_x,
+            crop_y=crop_y,
+        )
+        text = self.base.load_text(text_path)
+
+        return {
+            "pixel_values": pixel_values,
+            "latents": latents,
+            "text": text,
+            "data_type": "video",
+        }
+
+def create_datasets(config: TrainingConfig):
     """
-    Create a dummy dataloader for testing.
-    
-    Note: This is a placeholder - users should implement their own dataset and dataloader
-    that loads actual video/image data.
+    Note: This loader expects real data under data_roots with layout:
+        cropped_videos/*.mp4
+        video_latents/*.pt
+        cropped_seqs/*.txt  (captions)
     
     Required fields for Dataset __getitem__:
     - "pixel_values": torch.Tensor
@@ -1113,41 +1747,244 @@ def create_dummy_dataloader(config: TrainingConfig):
         "data_type": "video",
     }
     """
-    # This is a placeholder - users should implement their own dataloader
-    class DummyDataset:
-        def __init__(self, size=100):
-            self.size = size
-        
+    if not config.data_roots:
+        raise ValueError("data_roots must be a non-empty list of dataset folders.")
+
+    class VideoDataset:
+        def __init__(self, root_triples):
+            self.samples = []
+            self.target_video_length = int(config.video_length)
+            self.target_video_width = int(config.video_width)
+            self.target_video_height = int(config.video_height)
+            self.video_spatial_crop_margin = int(config.video_spatial_crop_margin)
+            self.base_seed = int(config.seed)
+
+            for root, text_root, video_root in root_triples:
+                if not video_root.is_dir():
+                    raise FileNotFoundError(f"Video dir not found: {video_root}")
+                if not text_root.is_dir():
+                    raise FileNotFoundError(f"Text dir not found: {text_root}")
+
+                video_paths = sorted(video_root.rglob("*.mp4"), key=lambda p: str(p))
+                for video_path in video_paths:
+                    stem = video_path.stem
+                    text_path = text_root / f"{stem}.txt"
+                    if not text_path.exists():
+                        continue
+                    self.samples.append((root, video_path, text_path))
+
+        def _get_video_num_frames(self, path: Path) -> int:
+            reader = imageio.get_reader(str(path))
+            try:
+                n_frames = -1
+                try:
+                    n_frames = int(reader.count_frames())
+                except Exception:
+                    meta = reader.get_meta_data()
+                    n_frames = int(meta.get("nframes", -1))
+
+                if n_frames <= 0:
+                    n_frames = 0
+                    for _ in reader:
+                        n_frames += 1
+
+                if n_frames <= 0:
+                    raise ValueError(f"Could not determine frame count for {path}")
+                return n_frames
+            finally:
+                reader.close()
+
+        def _normalize_4n_plus_1_length(self, num_frames: int, path: Path) -> int:
+            if num_frames < 1:
+                raise ValueError(f"Video {path} has too few frames ({num_frames})")
+            remainder = (num_frames - 1) % 4
+            target = num_frames - remainder
+            if target < 1:
+                raise ValueError(f"Video {path} has too few frames after normalization ({num_frames})")
+            return target
+
+        def _resize_dims(
+            self,
+            width: int,
+            height: int,
+            target_width: int,
+            target_height: int,
+            margin: int,
+        ) -> Tuple[int, int]:
+            scale = max(
+                (target_width + margin) / float(width),
+                (target_height + margin) / float(height),
+            )
+            resized_width = int(math.ceil(width * scale))
+            resized_height = int(math.ceil(height * scale))
+            return resized_width, resized_height
+
+        def sample_temporal_augmentation(self, path: Path, sample_idx: int) -> Tuple[int, int]:
+            total_frames = self._get_video_num_frames(path)
+            raw_segment_frames = min(total_frames, self.target_video_length)
+            segment_frames = self._normalize_4n_plus_1_length(raw_segment_frames, path)
+            max_start = total_frames - segment_frames
+            if max_start <= 0:
+                return 0, segment_frames
+
+            rng = torch.Generator(device="cpu")
+            rng.manual_seed((self.base_seed + int(sample_idx)) % (2**32 - 1))
+            start_frame_idx = int(torch.randint(0, max_start + 1, (1,), generator=rng).item())
+            return start_frame_idx, segment_frames
+
+        def load_video(
+            self,
+            path: Path,
+            start_frame_idx: int,
+            num_frames: int,
+            target_width: int = None,
+            target_height: int = None,
+            crop_margin: int = 0,
+            crop_seed: Optional[int] = None,
+            crop_x: Optional[int] = None,
+            crop_y: Optional[int] = None,
+        ) -> torch.Tensor:
+            start_frame_idx = max(0, int(start_frame_idx))
+            reader = imageio.get_reader(str(path))
+            frames = []
+            try:
+                num_frames = int(num_frames)
+                if num_frames <= 0:
+                    raise ValueError(f"num_frames must be > 0, got {num_frames} for {path}")
+                end_frame_idx = start_frame_idx + num_frames
+                for frame_idx in range(start_frame_idx, end_frame_idx):
+                    try:
+                        frame = reader.get_data(frame_idx)
+                    except Exception as e:
+                        raise ValueError(
+                            f"Failed to read frame {frame_idx} from {path} "
+                            f"for segment [{start_frame_idx}, {end_frame_idx})"
+                        ) from e
+                    if frame.ndim != 3 or frame.shape[-1] != 3:
+                        raise ValueError(f"Expected RGB (H,W,3), got {frame.shape} for {path}")
+                    frames.append(frame)
+            finally:
+                reader.close()
+
+            if not frames:
+                raise ValueError(
+                    f"No frames read from {path} for segment "
+                    f"[{start_frame_idx}, {start_frame_idx + int(num_frames)})"
+                )
+
+            video = np.stack(frames, axis=0).astype("float32")
+            video = video / 127.5 - 1.0
+            video = np.transpose(video, (3, 0, 1, 2))  # C, F, H, W
+            video = torch.from_numpy(video)
+
+            target_width = int(target_width)
+            target_height = int(target_height)
+            crop_margin = int(crop_margin)
+
+            _, _, orig_h, orig_w = video.shape
+            resized_width, resized_height = self._resize_dims(
+                width=int(orig_w),
+                height=int(orig_h),
+                target_width=target_width,
+                target_height=target_height,
+                margin=crop_margin,
+            )
+
+            max_x = resized_width - target_width
+            max_y = resized_height - target_height
+            if max_x < 0 or max_y < 0:
+                raise ValueError(f"Resize too small for crop: {resized_width}x{resized_height} from {path}")
+
+            if crop_x is None or crop_y is None:
+                rng = torch.Generator(device="cpu")
+                seed = int(crop_seed) if crop_seed is not None else 0
+                rng.manual_seed(seed % (2**32 - 1))
+                crop_x = int(torch.randint(0, max_x + 1, (1,), generator=rng).item()) if max_x > 0 else 0
+                crop_y = int(torch.randint(0, max_y + 1, (1,), generator=rng).item()) if max_y > 0 else 0
+            else:
+                crop_x = max(0, min(int(crop_x), max_x))
+                crop_y = max(0, min(int(crop_y), max_y))
+
+            frames = video.permute(1, 0, 2, 3).contiguous()  # [F, C, H, W]
+            frames = torch.nn.functional.interpolate(
+                frames,
+                size=(int(resized_height), int(resized_width)),
+                mode="bilinear",
+                align_corners=False,
+            )
+            frames = frames[:, :, crop_y : crop_y + target_height, crop_x : crop_x + target_width]
+            video = frames.permute(1, 0, 2, 3).contiguous()
+            return video
+
+        def load_text(self, path: Path) -> str:
+            return path.read_text(encoding="utf-8").strip()
+
         def __len__(self):
-            return self.size
-        
+            return len(self.samples)
+
         def __getitem__(self, idx):
-            # Video: temporal dimension must be 4n+1, using 17 frames
-            # Generate data in range [-1, 1]
+            root, video_path, text_path = self.samples[idx]
 
-            resolution = (121, 480, 848)
-            latent_resolution = [(resolution[0] - 1) // 4 + 1, resolution[1] // 16, resolution[2] // 16]
+            start_frame_idx, num_frames = self.sample_temporal_augmentation(video_path, idx)
+            pixel_values = self.load_video(
+                video_path,
+                start_frame_idx=start_frame_idx,
+                num_frames=num_frames,
+                target_width=self.target_video_width,
+                target_height=self.target_video_height,
+                crop_margin=self.video_spatial_crop_margin,
+                crop_seed=self.base_seed + int(idx) + 1,
+            )
+            frames = pixel_values.shape[1]
+            if (frames - 1) % 4 != 0:
+                raise ValueError(f"{video_path} has {frames} frames (expected 4n+1)")
 
-            data = torch.rand(3, *resolution) * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-            data_type = "video"
+            text = self.load_text(text_path)
 
             return {
-                "pixel_values": data,
-                "text": "A sample prompt",
-                "data_type": data_type,
-                "latents": torch.randn(32, *latent_resolution),
-                # "byt5_text_ids": torch.zeros((256), dtype=torch.int64),
-                # "byt5_text_mask": torch.zeros((256), dtype=torch.int64),
+                "pixel_values": pixel_values,
+                "text": text,
+                "data_type": "video",
             }
-    
-    dataset = DummyDataset()
-    dataloader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-    )
-    return dataloader
+
+    root_triples = []
+    for root in config.data_roots:
+        root_path = Path(root)
+        root_triples.append(
+            (
+                root_path,
+                root_path / "cropped_seqs",
+                root_path / "cropped_videos",
+            )
+        )
+
+    dataset = VideoDataset(root_triples)
+
+    total_size = len(dataset)
+    val_size = int(config.validation_split_size)
+    if val_size < 0:
+        raise ValueError(f"validation_split_size must be >= 0, got {val_size}")
+    if total_size > 1:
+        val_size = min(val_size, total_size - 1)
+    else:
+        val_size = 0
+    train_size = total_size - val_size
+
+    if train_size <= 0:
+        raise ValueError(
+            f"Training split is empty (total_size={total_size}, validation_split_size={val_size})."
+        )
+
+    if val_size > 0:
+        split_generator = torch.Generator().manual_seed(config.seed)
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            dataset, [train_size, val_size], generator=split_generator
+        )
+    else:
+        train_dataset = dataset
+        val_dataset = None
+
+    return train_dataset, val_dataset
 
 
 def main():
@@ -1155,13 +1992,13 @@ def main():
     
     # Model paths
     parser.add_argument("--pretrained_model_root", type=str, default='ckpts', help="Path to pretrained model")
-    parser.add_argument("--pretrained_transformer_version", type=str, default="480p_t2v", help="Transformer version")
+    parser.add_argument("--pretrained_transformer_version", type=str, default="480p_i2v", help="Transformer version")
     
     # Training parameters
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--max_steps", type=int, default=10000, help="Maximum training steps")
-    parser.add_argument("--warmup_steps", type=int, default=500, help="Warmup steps")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Maximum gradient norm")
     parser.add_argument("--train_timestep_shift", type=float, default=3.0, help="Train Timestep shift")
@@ -1172,11 +2009,40 @@ def main():
     # Data parameters
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--data_roots", type=str, nargs="+", default=None,
+                        help="Dataset root(s) containing cropped_videos/, and cropped_seqs/ (captions).")
+    parser.add_argument("--validation_split_size", type=int, default=0,
+                        help="Number of samples used for validation split (default: 0)")
+    parser.add_argument("--video_length", type=int, required=True,
+                        help="Target video length (frames) for downstream video augmentation.")
+    parser.add_argument("--video_width", type=int, required=True,
+                        help="Target video width for downstream video augmentation.")
+    parser.add_argument("--video_height", type=int, required=True,
+                        help="Target video height for downstream video augmentation.")
+    parser.add_argument("--video_spatial_crop_margin", type=int, default=40,
+                        help="Extra margin (pixels) used in resize scale computation before spatial crop.")
+    parser.add_argument(
+        "--epochs_per_plan",
+        type=int,
+        default=8,
+        help="Number of logical epochs to pack into one plan/request file (default: 8).",
+    )
     
     # Output parameters
     parser.add_argument("--output_dir", type=str, default="./outputs", help="Output directory")
     parser.add_argument("--save_interval", type=int, default=1000, help="Checkpoint save interval")
-    parser.add_argument("--log_interval", type=int, default=10, help="Logging interval")
+    parser.add_argument("--log_interval", type=int, default=1, help="Logging interval")
+    parser.add_argument("--use_wandb", type=str_to_bool, nargs="?", const=True, default=True,
+                        help="Enable Weights & Biases logging (default: true). "
+                             "Use --use_wandb or --use_wandb true/1 to enable, --use_wandb false/0 to disable")
+    parser.add_argument("--wandb_project", type=str, default="hunyuanvideo",
+                        help="Weights & Biases project name (default: hunyuanvideo)")
+    parser.add_argument("--wandb_entity", type=str, default=None,
+                        help="Weights & Biases entity (team/user). Default: None")
+    parser.add_argument("--wandb_run_name", type=str, default=None,
+                        help="Weights & Biases run name (default: auto-generated)")
+    parser.add_argument("--wandb_tags", type=str, nargs="+", default=None,
+                        help="Weights & Biases tags (space-separated). Default: None")
     
     # Other parameters
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp32"], help="Data type")
@@ -1214,6 +2080,18 @@ def main():
                         help="Prompts for validation (default: single default prompt). Can specify multiple prompts.")
     parser.add_argument("--validation_timestep_shift", type=float, default=5.0, help="Validation Timestep shift")
     parser.add_argument("--validate_video_length", type=int, default=241, help="Video length (number of frames) for validation (default: 241)")
+    parser.add_argument(
+        "--validation_batch_size", type=int, default=1,
+        help="Batch size for validation loss computation (default: 1)",
+    )
+    parser.add_argument(
+        "--validation_generation_size", type=int, default=1,
+        help="Number of validation samples to generate per validation run (default: 1)",
+    )
+    parser.add_argument(
+        "--validation_target_resolution", type=str, default="480p",
+        help="Target resolution for validation generation (e.g., 360p, 480p).",
+    )
     
     # Resume training parameters
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
@@ -1235,6 +2113,17 @@ def main():
     parser.add_argument("--pretrained_lora_path", type=str, default=None,
                         help="Path to pretrained LoRA adapter to load. If provided, will load this adapter instead of creating a new one.")
     
+    parser.add_argument("--training_latents_cache_root", type=str, default="dataset/training_cache_1",
+                        help="Root cache folder that contains plans/, requests/, latents/, status/, locks/")
+    parser.add_argument(
+        "--prebuilt_latents_cache_root", type=str, default=None,
+        help="When set, read plans/latents from this cache and do not create new plan/request files during training.",
+    )
+    parser.add_argument("--latents_wait_timeout_s", type=float, default=540.0,
+                        help="Seconds to wait for an external encoder to produce <job_id>.pt")
+    parser.add_argument("--latents_poll_interval_s", type=float, default=0.1,
+                        help="Polling interval while waiting for latents")
+
     args = parser.parse_args()
     
     config = TrainingConfig(
@@ -1248,9 +2137,21 @@ def main():
         max_grad_norm=args.max_grad_norm,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        data_roots=args.data_roots,
+        validation_split_size=args.validation_split_size,
+        video_length=args.video_length,
+        video_width=args.video_width,
+        video_height=args.video_height,
+        video_spatial_crop_margin=args.video_spatial_crop_margin,
+        epochs_per_plan=args.epochs_per_plan,
         output_dir=args.output_dir,
         save_interval=args.save_interval,
         log_interval=args.log_interval,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_tags=args.wandb_tags,
         dtype=args.dtype,
         seed=args.seed,
         i2v_prob=args.i2v_prob,
@@ -1265,6 +2166,9 @@ def main():
         validation_timestep_shift=args.validation_timestep_shift,
         snr_type=SNRType(args.flow_snr_type),
         validate_video_length=args.validate_video_length,
+        validation_batch_size=args.validation_batch_size,
+        validation_generation_size=args.validation_generation_size,
+        validation_target_resolution=args.validation_target_resolution,
         resume_from_checkpoint=args.resume_from_checkpoint,
         use_lora=args.use_lora,
         lora_r=args.lora_r,
@@ -1272,11 +2176,15 @@ def main():
         lora_dropout=args.lora_dropout,
         lora_target_modules=args.lora_target_modules,
         pretrained_lora_path=args.pretrained_lora_path,
+        training_latents_cache_root=args.training_latents_cache_root,
+        prebuilt_latents_cache_root=args.prebuilt_latents_cache_root,
+        latents_wait_timeout_s=args.latents_wait_timeout_s,
+        latents_poll_interval_s=args.latents_poll_interval_s,
     )
     
     trainer = HunyuanVideoTrainer(config)
-    dataloader = create_dummy_dataloader(config)
-    trainer.train(dataloader)
+    train_dataset, val_dataset = create_datasets(config)
+    trainer.train(train_dataset, val_dataset)
 
 
 if __name__ == "__main__":

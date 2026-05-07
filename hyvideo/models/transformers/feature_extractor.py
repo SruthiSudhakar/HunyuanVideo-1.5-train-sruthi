@@ -35,12 +35,15 @@ from .modules.posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
 from .modules.mlp_layers import MLP, MLPEmbedder, FinalLayer, LinearWarpforSingle
 from .modules.modulate_layers import ModulateDiT, modulate, apply_gate
 from .modules.token_refiner import SingleTokenRefiner
+from .modules.action_modules import ActionCrossAttnBlock, ActionDecodingInit, ActionOutProj, ActionSelfAttnBlock
 
 from hyvideo.utils.communications import all_gather
 from hyvideo.models.text_encoders.byT5 import ByT5Mapper
 from hyvideo.commons.parallel_states import get_parallel_state
 from diffusers.loaders.peft import PeftAdapterMixin
 
+import json
+from pathlib import Path
 
 class MMDoubleStreamBlock(nn.Module):
 
@@ -65,6 +68,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.attn_mode = attn_mode
 
         head_dim = hidden_size // heads_num
+        self.head_dim=head_dim
         mlp_hidden_dim = int(hidden_size * mlp_width_ratio)
 
         self.img_mod = ModulateDiT(
@@ -313,7 +317,7 @@ class MMSingleStreamBlock(nn.Module):
         
         return x + apply_gate(output, gate=mod_gate)
 
-class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
+class HunyuanVideo_1_5_FeatureTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
     """
     HunyuanVideo Transformer backbone.
 
@@ -523,6 +527,11 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             **factory_kwargs,
         )
 
+        self.action_decoding_init = None
+        self.action_decoding_blocks = None
+        self.action_decoding_selfattn_blocks = None
+        self.action_output_proj = None
+        
         # STA
         if attn_param is None:
             self.attn_param = { 
@@ -559,6 +568,45 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             # 2: vision_encoder feature
         else:
             self.cond_type_embedding = None
+    
+    def init_extra_modules_from_config(self, extra_cfg_path: str):
+
+        with open(extra_cfg_path, "r") as f:
+            extra_cfg = json.load(f)
+
+        if self.action_decoding_init is None:
+            cfg = extra_cfg.get("action_decoding_init", {})
+            self.action_decoding_init = ActionDecodingInit(
+                **cfg["input_args"],
+            )
+
+        if self.action_decoding_blocks is None:
+            cfg = extra_cfg.get("action_decoding_blocks", {})
+            depth = int(cfg["depth"])
+            pattern = cfg["cross_attn_mode"]
+            self.action_decoding_blocks = nn.ModuleList([
+                ActionCrossAttnBlock(
+                    cross_attn_mode=pattern[idx % len(pattern)],
+                    **cfg["input_args"],
+                )
+                for idx in range(depth)
+            ])
+
+        if self.action_decoding_selfattn_blocks is None:
+            cfg = extra_cfg.get("action_decoding_selfattn_blocks", {})
+            depth = int(cfg.get("depth", 0))
+            self.action_decoding_selfattn_blocks = nn.ModuleList([
+                ActionSelfAttnBlock(
+                    **cfg["input_args"],
+                )
+                for _ in range(depth)
+            ])
+
+        if self.action_output_proj is None:
+            cfg = extra_cfg.get("action_output_proj", {})
+            self.action_output_proj = ActionOutProj(
+                **cfg["input_args"],
+            )
 
     def load_hunyuan_state_dict(self, model_path):
         load_key = "module"
@@ -610,7 +658,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         for block in self.single_blocks:
             block.disable_deterministic()
 
-    def get_rotary_pos_embed(self, rope_sizes):
+    def get_rotary_pos_embed_with_h0w0(self, rope_sizes):
         target_ndim = 3
         head_dim = self.hidden_size // self.heads_num
         rope_dim_list = self.rope_dim_list
@@ -626,7 +674,15 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             use_real=True,
             theta_rescale_factor=1,
         )
-        return freqs_cos, freqs_sin
+
+        tt, th, tw = rope_sizes
+        freqs_cos_t = freqs_cos.view(tt, th, tw, -1)[:, 0, 0, :].contiguous()
+        freqs_sin_t = freqs_sin.view(tt, th, tw, -1)[:, 0, 0, :].contiguous()
+        return freqs_cos, freqs_sin, freqs_cos_t, freqs_sin_t
+
+    def slice_rope(self, freqs_cos, freqs_sin, head_dim: int):
+        assert freqs_cos.size(-1) >= head_dim and freqs_sin.size(-1) >= head_dim
+        return freqs_cos[..., :head_dim].contiguous(), freqs_sin[..., :head_dim].contiguous()
 
     def reorder_txt_token(self, byt5_txt, txt, byt5_text_mask, text_mask, zero_feat=False, is_reorder=True):
         if is_reorder:
@@ -675,9 +731,6 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         vision_states: torch.Tensor = None,
         output_features=False,
         output_features_stride=8,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
-        freqs_cos: Optional[torch.Tensor] = None,
-        freqs_sin: Optional[torch.Tensor] = None,
         return_dict: bool = False,
         guidance=None,
         mask_type="t2v",
@@ -700,9 +753,29 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             ow // self.patch_size[2],
         )
         self.attn_param['thw'] = [tt, th, tw]
-        if freqs_cos is None and freqs_sin is None:
-            freqs_cos, freqs_sin = self.get_rotary_pos_embed((tt, th, tw))
+        
+        if self.action_decoding_blocks is None or len(self.action_decoding_blocks) == 0:
+            raise ValueError("action_decoding_blocks must be initialized and non-empty.")
+        if len(self.action_decoding_blocks) != len(self.double_blocks):
+            raise ValueError(
+                f"Expected action_decoding_blocks depth {len(self.double_blocks)}, got {len(self.action_decoding_blocks)}."
+            )
 
+        freqs_cos, freqs_sin, freqs_cos_t, freqs_sin_t = self.get_rotary_pos_embed_with_h0w0((tt, th, tw))
+        freqs_cos_action_cross_video, freqs_sin_action_cross_video = self.slice_rope(
+            freqs_cos, freqs_sin, self.action_decoding_blocks[0].head_dim
+        )
+
+        freqs_cos_action0 = freqs_cos_t[0:1, :].repeat_interleave(self.action_decoding_init.K, dim=0)  # [T0*1*K, D]
+        freqs_sin_action0 = freqs_sin_t[0:1, :].repeat_interleave(self.action_decoding_init.K, dim=0)  # [T0*1*K, D]
+        freqs_cos_action_rest = freqs_cos_t[1:, :].repeat_interleave(self.action_decoding_init.R*self.action_decoding_init.K, dim=0)  # [(T-1)*R*K, D]
+        freqs_sin_action_rest = freqs_sin_t[1:, :].repeat_interleave(self.action_decoding_init.R*self.action_decoding_init.K, dim=0)  # [(T-1)*R*K, D]
+        freqs_cos_action = torch.cat([freqs_cos_action0, freqs_cos_action_rest], dim=0) # [K+(T-1)*R*K, D]
+        freqs_sin_action = torch.cat([freqs_sin_action0, freqs_sin_action_rest], dim=0) # [K+(T-1)*R*K, D]
+        freqs_cos_action, freqs_sin_action = self.slice_rope(
+            freqs_cos_action, freqs_sin_action, self.action_decoding_blocks[0].head_dim
+        )
+        
         img = self.img_in(img)
         parallel_dims = get_parallel_state()
         sp_enabled = parallel_dims.sp_enabled
@@ -715,6 +788,10 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             img = torch.chunk(img, sp_size, dim=1)[sp_rank]
             freqs_cos = torch.chunk(freqs_cos, sp_size, dim=0)[sp_rank]
             freqs_sin = torch.chunk(freqs_sin, sp_size, dim=0)[sp_rank]
+            freqs_cos_action_cross_video = torch.chunk(freqs_cos_action_cross_video, sp_size, dim=0)[sp_rank]
+            freqs_sin_action_cross_video = torch.chunk(freqs_sin_action_cross_video, sp_size, dim=0)[sp_rank]
+            freqs_cos_action = torch.chunk(freqs_cos_action, sp_size, dim=0)[sp_rank]
+            freqs_sin_action = torch.chunk(freqs_sin_action, sp_size, dim=0)[sp_rank]
 
         # Prepare modulation vectors
         vec = self.time_in(t)
@@ -795,8 +872,11 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             )
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+        freqs_cis_action = (freqs_cos_action, freqs_sin_action)
+        freqs_cis_action_cross_video = (freqs_cos_action_cross_video, freqs_sin_action_cross_video)
 
         features_list = [] if output_features else None
+        action_states = None
 
         # Pass through double-stream blocks
         for index, block in enumerate(self.double_blocks):
@@ -810,54 +890,62 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
                 )
             )
             self.attn_param["layer-name"] = f"double_block_{index+1}"
-            img, txt = block(
-                img=img,
-                txt=txt,
-                vec=vec,
-                freqs_cis=freqs_cis,
-                text_mask=text_mask,
-                attn_param=self.attn_param,
-                is_flash=force_full_attn,
-                block_idx=index,
-            )
-            if output_features and index % output_features_stride == 0:
-                features_list.append(img)
-
-        txt_seq_len = txt.shape[1]
-        img_seq_len = img.shape[1]
-
-        # Merge image and text for single-stream blocks
-        x = torch.cat((img, txt), 1)
-        if len(self.single_blocks) > 0:
-            for index, block in enumerate(self.single_blocks):
-                force_full_attn = (
-                    self.attn_mode in ["flex-block-attn"]
-                    and self.attn_param["win_type"] == "hybrid"
-                    and self.attn_param["win_ratio"] > 0
-                    and (
-                        (index + 1) % self.attn_param["win_ratio"] == 0
-                        or (index + 1) == len(self.single_blocks)
-                    )
-                )
-                self.attn_param["layer-name"] = f"single_block_{index+1}"
-                x = block(
-                    x=x,
+            with torch.no_grad():
+                img, txt = block(
+                    img=img,
+                    txt=txt,
                     vec=vec,
-                    txt_len=txt_seq_len,
-                    freqs_cis=(freqs_cos, freqs_sin),
+                    freqs_cis=freqs_cis,
                     text_mask=text_mask,
                     attn_param=self.attn_param,
                     is_flash=force_full_attn,
+                    block_idx=index,
                 )
-                if output_features and index % output_features_stride == 0:
-                    features_list.append(x[:, :img_seq_len, ...])
-        img = x[:, :img_seq_len, ...]
+
+            if index == 0:
+                if sp_enabled:
+                    img = all_gather(img, dim=1, group=parallel_dims.sp_group)
+                action_states = self.action_decoding_init(
+                    motion_states=img,
+                    num_latent_frames=tt,
+                )
+                if sp_enabled:
+                    img = torch.chunk(img, sp_size, dim=1)[sp_rank]
+                    action_states = torch.chunk(action_states, sp_size, dim=1)[sp_rank]
+
+            assert action_states is not None
+            assert action_states.shape[1] == freqs_cos_action.shape[0], (action_states.shape, freqs_cos_action.shape)
+
+            action_states = self.action_decoding_blocks[index](
+                hidden_states=action_states,
+                video_states=img,
+                freqs_cis_self=freqs_cis_action,
+                freqs_cis_cross=freqs_cis_action_cross_video,
+                tokens_per_q_frame=self.action_decoding_init.K,
+                tokens_per_kv_frame=int(th*tw),
+            )
+
+            if output_features and index % output_features_stride == 0:
+                features_list.append(img)
+
+        for block in self.action_decoding_selfattn_blocks:
+            action_states = block(
+                hidden_states=action_states,
+                freqs_cis_self=freqs_cis_action,
+            )
+
+        if sp_enabled:
+            action_states = all_gather(action_states, dim=1, group=parallel_dims.sp_group)
+
+        with torch.autocast(device_type="cuda", enabled=False):
+            actions_out = self.action_output_proj(action_states.float())
 
         # Final Layer
         img = self.final_layer(img, vec)
         if sp_enabled:
             img = all_gather(img, dim=1, group=parallel_dims.sp_group)
         img = self.unpatchify(img, tt, th, tw)
+        actions_out = self.unpack_action_sequence(actions_out)
         assert return_dict is False, "return_dict is not supported."
         if output_features:
             features_list = torch.stack(features_list, dim=0)
@@ -865,7 +953,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
                 features_list = all_gather(features_list, dim=2, group=parallel_dims.sp_group)
         else:
             features_list = None
-        return (img, features_list)
+        return (img, features_list, actions_out)
 
     def unpatchify(self, x, t, h, w):
         """
@@ -887,6 +975,27 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         x = torch.einsum("nthwcopq->nctohpwq", x)
         imgs = x.reshape(shape=(x.shape[0], c, t * pt, h * ph, w * pw))
         return imgs
+
+    def unpack_action_sequence(self, action_states: torch.Tensor) -> torch.Tensor:
+        """
+        Undo action sequence flattening.
+
+        Args:
+            action_states (Tensor): Input tensor of shape (B, L, D)
+
+        Returns:
+            Tensor: Output tensor of shape (B, T, J, D)
+        """
+        if action_states.dim() != 3:
+            raise ValueError(f"Expected action_states [B, L, D], got {tuple(action_states.shape)}")
+
+        B, L, D = action_states.shape
+        J = self.action_output_proj.num_joints
+        if L % J != 0:
+            raise ValueError(f"Expected L divisible by J={J}, got L={L}")
+
+        T = L // J
+        return action_states.view(B, T, J, D)
 
     def set_attn_mode(self, attn_mode: str):
         attn_mode = maybe_fallback_attn_mode(attn_mode)

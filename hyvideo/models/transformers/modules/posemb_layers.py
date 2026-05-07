@@ -206,6 +206,43 @@ def apply_rotary_emb(
     return xq_out, xk_out
 
 
+def apply_rotary_emb_single(
+    x: torch.Tensor,
+    freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    head_first: bool = False,
+) -> torch.Tensor:
+    """
+    Apply rotary embeddings to a single tensor (query or key) using the given frequency tensor.
+
+    Args:
+        x (torch.Tensor): Tensor to apply rotary embeddings. [B, S, H, D]
+        freqs_cis (torch.Tensor or tuple): Precomputed frequency tensor for complex exponential.
+        head_first (bool): head dimension first (except batch dim) or not.
+
+    Returns:
+        torch.Tensor: Modified tensor with rotary embeddings.
+
+    """
+    if isinstance(freqs_cis, tuple):
+        cos, sin = reshape_for_broadcast(freqs_cis, x, head_first)  # [S, D]
+        cos, sin = cos.to(x.device), sin.to(x.device)
+        x_float = x.float()
+        x_out = (x_float * cos + rotate_half(x_float) * sin).type_as(x)
+    else:
+        # view_as_complex will pack [..., D/2, 2](real) to [..., D/2](complex)
+        x_ = torch.view_as_complex(
+            x.float().reshape(*x.shape[:-1], -1, 2)
+        )  # [B, S, H, D//2]
+        freqs_cis = reshape_for_broadcast(freqs_cis, x_, head_first).to(
+            x.device
+        )  # [S, D//2] --> [1, S, 1, D//2]
+        # (real, imag) * (cos, sin) = (real * cos - imag * sin, imag * cos + real * sin)
+        # view_as_real will expand [..., D/2](complex) to [..., D/2, 2](real)
+        x_out = torch.view_as_real(x_ * freqs_cis).flatten(3).type_as(x)
+
+    return x_out
+
+
 @cache
 def get_nd_rotary_pos_embed(
     rope_dim_list,

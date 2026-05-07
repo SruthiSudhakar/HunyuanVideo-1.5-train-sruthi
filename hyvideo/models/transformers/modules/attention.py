@@ -20,6 +20,7 @@ from typing import Optional
 from loguru import logger
 import numpy as np
 import torch.nn.functional as F
+from typing import Optional, Literal
 
 from hyvideo.commons.parallel_states import get_parallel_state
 from hyvideo.utils.communications import (
@@ -294,5 +295,266 @@ def sequence_parallel_attention(q, k, v,
 
     b, s, a, d = hidden_states.shape
     hidden_states = hidden_states.reshape(b, s, -1)
+
+    return hidden_states
+
+
+@torch.compiler.disable
+def single_stream_sequence_parallel_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    mode: Literal[
+        "self_full",          # full bidirectional self-attention over all tokens (q==k==v typically)
+        "cross_frame_aligned",# each query frame attends only to tokens of its corresponding compressed frame
+        "cross_full",         # each query attends to all kv tokens
+    ] = "self_full",
+    tokens_per_q_frame: int = 0,
+    tokens_per_kv_frame: int = 0,
+    q_is_fully_gathered: bool = False,
+    k_is_fully_gathered: bool = False,
+    v_is_fully_gathered: bool = False,
+) -> torch.Tensor:
+    """
+    cross_frame_aligned:
+        q: [B, T * Qf, H, D]
+        k,v: [B, T * Kvf, H, D]
+    Each query frame attends only to the KV tokens from the same frame.
+    """
+    parallel_dims = get_parallel_state()
+    enable_sp = parallel_dims.sp_enabled
+
+    query = q
+    key = k
+    value = v
+
+    # Ulysses: input is seq-sharded, convert to (global_seq, local_heads)
+    if enable_sp:
+        sp_group = parallel_dims.sp_group
+        sp_size = parallel_dims.sp
+        sp_rank = parallel_dims.sp_rank
+
+        def shrink_head(state: torch.Tensor, dim: int) -> torch.Tensor:
+            local_heads = state.shape[dim] // sp_size
+            return state.narrow(dim, sp_rank * local_heads, local_heads)
+
+        if q_is_fully_gathered:
+            query = shrink_head(query, dim=2)
+        else:
+            query = all_to_all_4D(query, sp_group, scatter_dim=2, gather_dim=1)  # (B, Lq_global, H_local, D)
+
+        if k_is_fully_gathered:
+            key = shrink_head(key, dim=2)
+        else:
+            key = all_to_all_4D(key, sp_group, scatter_dim=2, gather_dim=1)  # (B, Lkv_global, H_local, D)
+
+        if v_is_fully_gathered:
+            value = shrink_head(value, dim=2)
+        else:
+            value = all_to_all_4D(value, sp_group, scatter_dim=2, gather_dim=1)
+
+    B, Lq, Hh, Dd = query.shape
+    _, Lkv, _, _ = key.shape
+
+    # SDPA expects (B, H, L, D) for 4D or (N, L, D) for 3D.
+    query_t = query.transpose(1, 2)  # (B, H_local, Lq, D)
+    key_t   = key.transpose(1, 2)    # (B, H_local, Lkv, D)
+    value_t = value.transpose(1, 2)  # (B, H_local, Lkv, D)
+
+    if mode == "self_full":
+        # Keep your flash fast-path if present; replace flex fallback with SDPA.
+        attn_mode = maybe_fallback_attn_mode("flash")
+        if attn_mode == "flash3":
+            qkv = torch.stack([query, key, value], dim=2)  # (B, Lq, 3, H_local, D)
+            hidden = flash_attn_no_pad_v3(qkv, None, causal=False, dropout_p=0.0, softmax_scale=None)
+        elif attn_mode == "flash2":
+            qkv = torch.stack([query, key, value], dim=2)  # (B, Lq, 3, H_local, D)
+            hidden = flash_attn_no_pad(qkv, None, causal=False, dropout_p=0.0, softmax_scale=None)
+        else:
+            # Torch SDPA (no mask, non-causal). Likely dispatches to flash/mem-effic kernels when available.
+            hidden = F.scaled_dot_product_attention(
+                query_t, key_t, value_t,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+            ).transpose(1, 2)  # (B, Lq, H_local, D)
+
+    elif mode == "cross_full":
+        # Full cross-attn without mask (Lq is usually small here, so memory is fine).
+        hidden = F.scaled_dot_product_attention(
+            query_t, key_t, value_t,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+        ).transpose(1, 2)  # (B, Lq, H_local, D)
+    elif mode == "cross_frame_aligned":
+        if tokens_per_kv_frame <= 0:
+            raise ValueError("tokens_per_kv_frame must be > 0 for cross_frame_aligned")
+
+        if Lkv % tokens_per_kv_frame != 0:
+            raise ValueError(
+                f"Lkv={Lkv} must be divisible by tokens_per_kv_frame={tokens_per_kv_frame}"
+            )
+
+        T = Lkv // tokens_per_kv_frame
+
+        if tokens_per_q_frame <= 0:
+            if Lq % T != 0:
+                raise ValueError(
+                    f"Lq={Lq} must be divisible by number of frames T={T}. "
+                    "Pass tokens_per_q_frame explicitly."
+                )
+            tokens_per_q_frame = Lq // T
+
+        if Lq != T * tokens_per_q_frame:
+            raise ValueError(
+                f"Lq mismatch: expected {T} * {tokens_per_q_frame} = {T * tokens_per_q_frame}, got {Lq}"
+            )
+
+        # reshape into per-frame groups
+        # query_t: [B, H, T*Qf, D] -> [B, H, T, Qf, D]
+        # key_t:   [B, H, T*Kvf, D] -> [B, H, T, Kvf, D]
+        query_tf = query_t.view(B, Hh, T, tokens_per_q_frame, Dd)
+        key_tf   = key_t.view(B, Hh, T, tokens_per_kv_frame, Dd)
+        value_tf = value_t.view(B, Hh, T, tokens_per_kv_frame, Dd)
+
+        # merge (B,H,T) into batch so each frame attends only within itself
+        query_flat = query_tf.permute(0, 2, 1, 3, 4).reshape(B * T, Hh, tokens_per_q_frame, Dd)
+        key_flat   = key_tf.permute(0, 2, 1, 3, 4).reshape(B * T, Hh, tokens_per_kv_frame, Dd)
+        value_flat = value_tf.permute(0, 2, 1, 3, 4).reshape(B * T, Hh, tokens_per_kv_frame, Dd)
+
+        hidden_flat = F.scaled_dot_product_attention(
+            query_flat,
+            key_flat,
+            value_flat,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+        )  # [B*T, H, Qf, D]
+
+        hidden = (
+            hidden_flat
+            .view(B, T, Hh, tokens_per_q_frame, Dd)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B, Hh, Lq, Dd)
+            .transpose(1, 2)
+            .contiguous()
+        )  # [B, Lq, H, D]
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    # Inverse Ulysses transform back to seq-sharded layout with global heads
+    if enable_sp:
+        sp_group = parallel_dims.sp_group
+        if q_is_fully_gathered:
+            hidden = all_gather(hidden, dim=2, group=sp_group)  # (B, Lq_global, H, D)
+        else:
+            hidden = all_to_all_4D(hidden, sp_group, scatter_dim=1, gather_dim=2)  # (B, Lq_shard, H, D)
+        hidden = hidden.to(q.dtype)
+
+    b, s, h, d = hidden.shape
+    hidden = hidden.reshape(b, s, -1)
+
+    return hidden
+
+
+@torch.compiler.disable
+def double_stream_sequence_parallel_attention(
+    q: tuple[torch.Tensor, torch.Tensor],
+    k: tuple[torch.Tensor, torch.Tensor],
+    v: tuple[torch.Tensor, torch.Tensor],
+    *,
+    drop_rate: float = 0.0,
+    attn_mode: str = "flash",   # "flash" / "flash2" / "flash3" / "torch"
+) -> torch.Tensor:
+    """
+    Full bidirectional self-attention over the *concatenation* of two streams, with Ulysses-style
+    sequence parallel (SP) assumed for BOTH streams.
+
+    Inputs (each stream):
+      q_i, k_i, v_i: [B, L_i_shard, H, D]   (sequence-sharded, full heads)
+
+    Behavior:
+      1) If SP enabled: all_to_all_4D(..., scatter_dim=2, gather_dim=1) per-stream to get
+         [B, L_i_global, H_local, D]
+      2) Concatenate streams along sequence: L_total = L0_global + L1_global
+      3) Run full (non-causal) attention with NO mask over the concatenated tokens
+      4) Split back to two streams
+      5) If SP enabled: inverse all_to_all_4D(..., scatter_dim=1, gather_dim=2) per-stream
+      6) Return per-stream outputs as [B, L_i_shard, H*D]
+
+    Returns:
+      out0, out1: each [B, L_i_shard, H*D]
+    """
+    q0, q1 = q
+    k0, k1 = k
+    v0, v1 = v
+
+    parallel_dims = get_parallel_state()
+    enable_sp = parallel_dims.sp_enabled
+
+    # Ulysses: (seq-sharded, full heads) -> (global seq, local heads)
+    if enable_sp:
+        sp_group = parallel_dims.sp_group
+        q0 = all_to_all_4D(q0, sp_group, scatter_dim=2, gather_dim=1)  # [B, L0_global, H_local, D]
+        k0 = all_to_all_4D(k0, sp_group, scatter_dim=2, gather_dim=1)
+        v0 = all_to_all_4D(v0, sp_group, scatter_dim=2, gather_dim=1)
+
+        q1 = all_to_all_4D(q1, sp_group, scatter_dim=2, gather_dim=1)  # [B, L1_global, H_local, D]
+        k1 = all_to_all_4D(k1, sp_group, scatter_dim=2, gather_dim=1)
+        v1 = all_to_all_4D(v1, sp_group, scatter_dim=2, gather_dim=1)
+
+    L0 = q0.size(1)
+    L1 = q1.size(1)
+
+    # Concatenate along sequence (joint self-attn across both streams)
+    q_cat = torch.cat([q0, q1], dim=1)  # [B, Ltot, H{local/full}, D]
+    k_cat = torch.cat([k0, k1], dim=1)
+    v_cat = torch.cat([v0, v1], dim=1)
+
+    # Run full attention, no mask, non-causal
+    attn_mode = maybe_fallback_attn_mode(attn_mode)
+
+    if attn_mode in ("flash3", "flash2"):
+        # flash expects [B, S, 3, H, D]
+        qkv = torch.stack([q_cat, k_cat, v_cat], dim=2)
+        if attn_mode == "flash3":
+            hidden = flash_attn_no_pad_v3(
+                qkv, None, causal=False, dropout_p=drop_rate, softmax_scale=None
+            )  # [B, S, H, D]
+        else:
+            hidden = flash_attn_no_pad(
+                qkv, None, causal=False, dropout_p=drop_rate, softmax_scale=None
+            )
+    elif attn_mode == "torch":
+        # torch SDPA path: (B,H,S,D)
+        query = q_cat.transpose(1, 2)
+        key = k_cat.transpose(1, 2)
+        value = v_cat.transpose(1, 2)
+        hidden = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=None, dropout_p=drop_rate, is_causal=False
+        ).transpose(1, 2)  # [B, S, H, D]
+    else:
+        # fallback: flex_attention expects (B,H,S,D)
+        query = q_cat.transpose(1, 2)
+        key = k_cat.transpose(1, 2)
+        value = v_cat.transpose(1, 2)
+        hidden = flex_attention(query, key, value).transpose(1, 2)  # [B, S, H, D]
+
+    # Split back into streams in the current layout (global seq / local heads if SP enabled)
+    h0, h1 = hidden.split_with_sizes((L0, L1), dim=1)
+
+    # Inverse Ulysses: (global seq, local heads) -> (seq-sharded, full heads)
+    if enable_sp:
+        sp_group = parallel_dims.sp_group
+        h0 = all_to_all_4D(h0, sp_group, scatter_dim=1, gather_dim=2).contiguous()  # [B, L0_shard, H, D]
+        h1 = all_to_all_4D(h1, sp_group, scatter_dim=1, gather_dim=2).contiguous()  # [B, L1_shard, H, D]
+
+    # Concatenate in (sharded) sequence dimension like original function output
+    hidden_states = torch.cat([h0, h1], dim=1).to(q0.dtype)  # [B, L0_shard+L1_shard, H, D]
+
+    b, s, h, d = hidden_states.shape
+    hidden_states = hidden_states.reshape(b, s, -1)  # [B, S_shard_total, H*D]
 
     return hidden_states

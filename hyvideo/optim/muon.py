@@ -10,7 +10,77 @@ try:
     )
 except ImportError:
     # handle old pytorch versions
-    Dtensor = None
+    DTensor = None
+
+
+def compute_average_gradnorm_by_group(
+    module,
+    prefix_groups=None,
+    substring_groups=None,
+    require_grad_only=True,
+):
+    """Compute RMS grad per named-parameter group.
+
+    Returns per group:
+        sqrt(sum_i g_i^2 / numel)
+
+    where `numel` is the total number of gradient elements assigned to the group.
+
+    Priority rule:
+    - If the same group name exists in both substring_groups and prefix_groups,
+      substring match takes priority for that parameter/group (no double count).
+    """
+    prefix_groups = prefix_groups or {}
+    substring_groups = substring_groups or {}
+
+    # Accumulate sum of squared grads and total element count per group
+    group_sumsq = {k: 0.0 for k in prefix_groups}
+    group_numel = {k: 0 for k in prefix_groups}
+    for k in substring_groups:
+        group_sumsq.setdefault(k, 0.0)
+        group_numel.setdefault(k, 0)
+
+    # Pre-normalize patterns (drop empty strings)
+    prefix_items = [(g, tuple(p for p in pats if p)) for g, pats in prefix_groups.items()]
+    substr_items = [(g, tuple(s for s in pats if s)) for g, pats in substring_groups.items()]
+
+    for name, param in module.named_parameters():
+        if require_grad_only and not param.requires_grad:
+            continue
+
+        grad = param.grad
+        if grad is None:
+            continue
+        if hasattr(grad, "to_local"):
+            grad = grad.to_local()
+
+        # Detach/read-only; does not affect autograd or loss computation
+        g = grad.detach().float()
+        grad_sumsq = float((g * g).sum().item())
+        grad_numel = g.numel()
+
+        # Track which group names already matched via substring (higher priority)
+        substring_matched_groups = set()
+
+        # 1) Substring groups first (higher priority)
+        for group_name, substrings in substr_items:
+            if substrings and any(sub in name for sub in substrings):
+                group_sumsq[group_name] += grad_sumsq
+                group_numel[group_name] += grad_numel
+                substring_matched_groups.add(group_name)
+
+        # 2) Prefix groups second, but skip same group if substring already matched
+        for group_name, prefixes in prefix_items:
+            if group_name in substring_matched_groups:
+                continue
+            if prefixes and any(name.startswith(prefix) for prefix in prefixes):
+                group_sumsq[group_name] += grad_sumsq
+                group_numel[group_name] += grad_numel
+
+    return {
+        group_name: (math.sqrt(group_sumsq[group_name] / group_numel[group_name]) if group_numel[group_name] > 0 else 0.0)
+        for group_name in group_sumsq
+    }
 
 # This code is modified from the GitHub repository of KellerJordan:
 # https://github.com/KellerJordan/Muon/blob/master/muon.py
@@ -92,18 +162,41 @@ class Muon(torch.optim.Optimizer):
             adamw_eps=adamw_eps,
         )
 
-        params = list(muon_params)
+        muon_params = list(muon_params) if muon_params is not None else []
         adamw_params = list(adamw_params) if adamw_params is not None else []
-        params.extend(adamw_params)
-        super().__init__(params, defaults)
+
+        param_groups = []
+        if muon_params and isinstance(muon_params[0], dict):
+            param_groups.extend(muon_params)
+        elif muon_params:
+            param_groups.append({"params": muon_params})
+        if adamw_params and isinstance(adamw_params[0], dict):
+            param_groups.extend(adamw_params)
+        elif adamw_params:
+            param_groups.append({"params": adamw_params})
+
+        super().__init__(param_groups, defaults)
+
         # Sort parameters into those for which we will use Muon, and those for which we will not
-        for p in muon_params:
-            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
-            assert p.ndim >= 2, p.ndim
-            self.state[p]["use_muon"] = True
-        for p in adamw_params:
-            # Do not use Muon for parameters in adamw_params
-            self.state[p]["use_muon"] = False
+        if muon_params and isinstance(muon_params[0], dict):
+            for group in muon_params:
+                for p in group["params"]:
+                    assert p.ndim >= 2, p.ndim
+                    self.state[p]["use_muon"] = True
+        else:
+            for p in muon_params:
+                # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
+                assert p.ndim >= 2, p.ndim
+                self.state[p]["use_muon"] = True
+
+        if adamw_params and isinstance(adamw_params[0], dict):
+            for group in adamw_params:
+                for p in group["params"]:
+                    self.state[p]["use_muon"] = False
+        else:
+            for p in adamw_params:
+                # Do not use Muon for parameters in adamw_params
+                self.state[p]["use_muon"] = False
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -142,12 +235,13 @@ class Muon(torch.optim.Optimizer):
                 # sanity check
                 g = p.grad
                 if g is None:
-                    # For i2v task, vision_in does not have gradients.
-                    # Creating a dummy gradient to allow `full_tensor` computation.
-                    if isinstance(p, DTensor):
-                        g = DTensor.from_local(torch.zeros_like(p.to_local()), p.device_mesh, placements=p.placements)
-                    else:
-                        g = torch.zeros_like(p)
+                    # # For i2v task, vision_in does not have gradients.
+                    # # Creating a dummy gradient to allow `full_tensor` computation.
+                    # if isinstance(p, DTensor):
+                    #     g = DTensor.from_local(torch.zeros_like(p.to_local()), p.device_mesh, placements=p.placements)
+                    # else:
+                    #     g = torch.zeros_like(p)
+                    continue
                 if g.ndim > 2:
                     g = g.view(g.size(0), -1)
                 assert g is not None
@@ -211,17 +305,73 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 # help function to create the Muon optimizer
-def get_muon_optimizer(model, lr=1e-3,  weight_decay=0.1, momentum=0.95, adamw_betas=(0.95, 0.95), adamw_eps=1e-8):
-    muon_params = [
-        p
-        for name, p in model.named_parameters()
-        if p.requires_grad and p.ndim >= 2 
-    ]
-    adamw_params = [
-        p
-        for name, p in model.named_parameters()
-        if p.requires_grad and not (p.ndim >= 2)
-    ]
+def get_muon_optimizer(
+    model,
+    lr=1e-3,
+    weight_decay=0.1,
+    momentum=0.95,
+    adamw_betas=(0.95, 0.95),
+    adamw_eps=1e-8,
+    adamw_name_substrings=["lora_",],
+    lr_overrides=None,
+    lora_name_substring="lora_",
+    save_param_info=True,
+    param_info_path="muon_param_lrs_rank0.txt",
+):
+    def use_adamw_for_name(name):
+        return any(substring in name for substring in adamw_name_substrings)
+
+    lr_overrides = lr_overrides or {}
+
+    def resolve_lr(name):
+        # Priority: LoRA > action_xattn > action_encoding > feature_transformer > transformer > base lr
+        if lr_overrides.get("lora") is not None and lora_name_substring in name:
+            return lr_overrides["lora"]
+        if lr_overrides.get("action_xattn") is not None and "action_xattn" in name:
+            return lr_overrides["action_xattn"]
+        if lr_overrides.get("action_encoding") is not None and ("action_encoding_init" in name or "action_encode_blocks" in name):
+            return lr_overrides["action_encoding"]
+        if lr_overrides.get("feature_transformer") is not None and name.startswith("feature_transformer."):
+            return lr_overrides["feature_transformer"]
+        if lr_overrides.get("transformer") is not None and name.startswith("transformer."):
+            return lr_overrides["transformer"]
+        return lr
+
+    muon_group_map = {}
+    adamw_group_map = {}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        target_lr = resolve_lr(name)
+        if p.ndim >= 2 and (not use_adamw_for_name(name)):
+            muon_group_map.setdefault(target_lr, []).append(p)
+        else:
+            adamw_group_map.setdefault(target_lr, []).append(p)
+
+    muon_params = [{"params": params, "lr": group_lr} for group_lr, params in muon_group_map.items()]
+    adamw_params = [{"params": params, "lr": group_lr} for group_lr, params in adamw_group_map.items()]
+
+    if save_param_info:
+        is_rank0 = True
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            is_rank0 = (torch.distributed.get_rank() == 0)
+
+        if is_rank0:
+            lines = ["name\tshape\tstatus\tlr\toptimizer"]
+            for name, p in model.named_parameters():
+                shape = "x".join(str(dim) for dim in p.shape)
+                if p.requires_grad:
+                    target_lr = resolve_lr(name)
+                    if p.ndim >= 2 and (not use_adamw_for_name(name)):
+                        optimizer_name = "muon"
+                    else:
+                        optimizer_name = "adamw"
+                    lines.append(f"{name}\t{shape}\ttrainable\t{target_lr}\t{optimizer_name}")
+                else:
+                    lines.append(f"{name}\t{shape}\tfrozen\t-\tfrozen")
+
+            with open(param_info_path, "w") as f:
+                f.write("\n".join(lines) + "\n")
 
     return Muon(
         lr=lr,

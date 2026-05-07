@@ -87,15 +87,14 @@ class HunyuanVideoPipelineOutput(BaseOutput):
 class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->byt5_model->transformer->vae"
-    _optional_components = ["text_encoder", "text_encoder_2", "feature_transformer", "vae"]
+    _optional_components = ["text_encoder_2"]
 
     def __init__(
         self,
-        vae: Optional[AutoencoderKL],
-        text_encoder: Optional[TextEncoder],
+        vae: AutoencoderKL,
+        text_encoder: TextEncoder,
         transformer: HunyuanVideo_1_5_DiffusionTransformer,
         scheduler: KarrasDiffusionSchedulers,
-        feature_transformer: Optional[HunyuanVideo_1_5_DiffusionTransformer] = None,
         text_encoder_2: Optional[TextEncoder] = None,
         flow_shift: float = 7.0,
         guidance_scale: float = 6.0,
@@ -142,7 +141,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 text_encoder_2=text_encoder_2,
                 byt5_model=byt5_model,
                 byt5_tokenizer=byt5_tokenizer,
-                feature_transformer=feature_transformer,
             )
             self.prompt_format = prompt_format
         else:
@@ -152,24 +150,14 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 transformer=transformer,
                 scheduler=scheduler,
                 text_encoder_2=text_encoder_2,
-                feature_transformer=feature_transformer,
             )
             self.byt5_model = None
             self.byt5_tokenizer = None
-            self.byt5_max_length = byt5_max_length
-            self.prompt_format = prompt_format
 
-        if self.vae is not None:
-            self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-            self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-        else:
-            self.vae_scale_factor = None
-            self.image_processor = None
 
-        if text_encoder is not None:
-            self.text_len = text_encoder.max_length
-        else:
-            self.text_len = 0
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.text_len = text_encoder.max_length
         self.target_dtype = torch.bfloat16
         self.vae_dtype = torch.float16
         self.autocast_enabled = True
@@ -971,7 +959,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             ```
         """
         num_videos_per_prompt = 1
-        target_resolution = self.ideal_resolution
+        target_resolution = kwargs.get("target_resolution", self.ideal_resolution)
+        if target_resolution is not None and target_resolution not in self.target_size_config:
+            supported = ", ".join(self.target_size_config.keys())
+            raise ValueError(
+                f"Unsupported target_resolution: {target_resolution}. Supported values: {supported}"
+            )
 
         if guidance_scale is None:
             guidance_scale = self.config.guidance_scale
@@ -1047,12 +1040,13 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
         if reference_image is not None:
             if self.ideal_resolution is not None and target_resolution != self.ideal_resolution:
-                raise ValueError(
-                    f'The loaded pipeline is trained for {self.ideal_resolution} resolution, but received input for {target_resolution} resolution. '
-                )
+                # raise ValueError(
+                #     f'The loaded pipeline is trained for {self.ideal_resolution} resolution, but received input for {target_resolution} resolution. '
+                # )
+                loguru.logger.warning(f'The loaded pipeline is trained for {self.ideal_resolution} resolution, but received input for {target_resolution} resolution. ')
             height, width = self.get_closest_resolution_given_reference_image(reference_image, target_resolution)
         else:
-            if self.ideal_resolution is not None:
+            if target_resolution is not None:
                 if ":" not in aspect_ratio:
                     raise ValueError("aspect_ratio must be separated by a colon")
                 width, height = aspect_ratio.split(":")
@@ -1061,9 +1055,9 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     raise ValueError("width and height must be positive integers and separated by a colon in aspect_ratio")
                 width = int(width)
                 height = int(height)
-                height, width = self.get_closest_resolution_given_original_size((width, height), self.ideal_resolution)
+                height, width = self.get_closest_resolution_given_original_size((width, height), target_resolution)
             else:
-                raise ValueError("ideal_resolution is not set")
+                raise ValueError("target_resolution is not set")
 
         latent_target_length, latent_height, latent_width = self.get_latent_size(video_length, height, width)
         n_tokens = latent_target_length * latent_height * latent_width
@@ -1476,7 +1470,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         return transformer_version
 
     @classmethod
-    def create_pipeline(cls, pretrained_model_name_or_path, transformer_version, create_sr_pipeline=False, transformer_dtype=torch.bfloat16, device=None, transformer_init_device=None, create_feature_transformer=False, create_text_encoder=True, create_vae=True, **kwargs):
+    def create_pipeline(cls, pretrained_model_name_or_path, transformer_version, create_sr_pipeline=False, transformer_dtype=torch.bfloat16, device=None, transformer_init_device=None, **kwargs):
         # use snapshot download here to get it working from from_pretrained
 
         if not os.path.isdir(pretrained_model_name_or_path):
@@ -1515,47 +1509,28 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 'pretrained_model_name_or_path': os.path.join(cached_folder, "transformer", transformer_version),
             }
 
+        vae_inference_config = cls.get_vae_inference_config()
         transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
             **from_pretrain_kwargs,
             torch_dtype=transformer_dtype, 
             low_cpu_mem_usage=True,
         ).to(transformer_init_device)
-        
-        feature_transformer = None
-        if create_feature_transformer:
-            feature_transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
-                **from_pretrain_kwargs,
-                torch_dtype=transformer_dtype,
-                low_cpu_mem_usage=True,
-            ).to(transformer_init_device)
 
-        vae = None
-        if create_vae:
-            vae_inference_config = cls.get_vae_inference_config()
-            vae = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(
-                os.path.join(cached_folder, "vae"), 
-                torch_dtype=vae_inference_config['dtype']
-            ).to(device)
-            vae.set_tile_sample_min_size(vae_inference_config['sample_size'], vae_inference_config['tile_overlap_factor'])
+        vae = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(
+            os.path.join(cached_folder, "vae"), 
+            torch_dtype=vae_inference_config['dtype']
+        ).to(device)
+        vae.set_tile_sample_min_size(vae_inference_config['sample_size'], vae_inference_config['tile_overlap_factor'])
         scheduler = FlowMatchDiscreteScheduler.from_pretrained(os.path.join(cached_folder, "scheduler"))
 
-        byt5_max_length = 256
-        if create_text_encoder:
-            byt5_kwargs, prompt_format = cls._load_byt5(cached_folder, True, byt5_max_length, device=device)
-            text_encoder, text_encoder_2 = cls._load_text_encoders(cached_folder, device=device)
-            glyph_byT5_v2 = True
-        else:
-            byt5_kwargs = {"byt5_model": None, "byt5_tokenizer": None, "byt5_max_length": byt5_max_length}
-            prompt_format = None
-            text_encoder, text_encoder_2 = None, None
-            glyph_byT5_v2 = False
+        byt5_kwargs, prompt_format = cls._load_byt5(cached_folder, True, 256, device=device)
+        text_encoder, text_encoder_2 = cls._load_text_encoders(cached_folder, device=device)
         vision_encoder = cls._load_vision_encoder(cached_folder, device=device)
 
         pipeline = cls(
             vae=vae,
             text_encoder=text_encoder,
             transformer=transformer,
-            feature_transformer=feature_transformer,
             scheduler=scheduler,
             text_encoder_2=text_encoder_2,
             progress_bar_config=None,
@@ -1563,7 +1538,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             byt5_tokenizer=byt5_kwargs["byt5_tokenizer"],
             byt5_max_length=byt5_kwargs["byt5_max_length"],
             prompt_format=prompt_format,
-            glyph_byT5_v2=glyph_byT5_v2,
             execution_device='cuda',
             vision_encoder=vision_encoder,
             enable_offloading=False,

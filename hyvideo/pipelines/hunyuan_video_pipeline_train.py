@@ -17,9 +17,9 @@
 
 import psutil
 import inspect
+import json
 import os
 import random
-import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -52,11 +52,12 @@ from hyvideo.commons import (
 from hyvideo.commons.parallel_states import get_parallel_state
 
 from hyvideo.models.autoencoders import hunyuanvideo_15_vae
-from hyvideo.models.text_encoders import PROMPT_TEMPLATE, TextEncoder
-from hyvideo.models.text_encoders.byT5 import load_glyph_byT5_v2
-from hyvideo.models.text_encoders.byT5.format_prompt import MultilingualPromptFormat
-from hyvideo.models.transformers.hunyuanvideo_1_5_transformer import (
-    HunyuanVideo_1_5_DiffusionTransformer,
+from hyvideo.models.text_encoders import TextEncoder
+from hyvideo.models.transformers.motion_generator import (
+    HunyuanVideo_1_5_MotionTransformer,
+)
+from hyvideo.models.transformers.feature_extractor import (
+    HunyuanVideo_1_5_FeatureTransformer,
 )
 from hyvideo.models.transformers.modules.upsample import SRTo720pUpsampler, SRTo1080pUpsampler
 from hyvideo.models.vision_encoder import VisionEncoder
@@ -86,15 +87,16 @@ class HunyuanVideoPipelineOutput(BaseOutput):
 
 class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
-    model_cpu_offload_seq = "text_encoder->text_encoder_2->byt5_model->transformer->vae"
-    _optional_components = ["text_encoder_2"]
+    model_cpu_offload_seq = "transformer->vae"
 
     def __init__(
         self,
-        vae: AutoencoderKL,
-        text_encoder: TextEncoder,
-        transformer: HunyuanVideo_1_5_DiffusionTransformer,
         scheduler: KarrasDiffusionSchedulers,
+        vae: Optional[AutoencoderKL] = None,
+        vae_config: Optional[Dict[str, Any]] = None,
+        transformer: Optional[HunyuanVideo_1_5_MotionTransformer] = None,
+        feature_transformer: Optional[HunyuanVideo_1_5_FeatureTransformer] = None,
+        text_encoder: Optional[TextEncoder] = None,
         text_encoder_2: Optional[TextEncoder] = None,
         flow_shift: float = 7.0,
         guidance_scale: float = 6.0,
@@ -104,10 +106,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         vision_num_semantic_tokens=729,
         vision_states_dim=1152,
         glyph_byT5_v2=True,
-        byt5_model=None,
-        byt5_tokenizer=None,
-        byt5_max_length=256,
-        prompt_format=None,
         execution_device=None,
         vision_encoder=None,
         enable_offloading=False,
@@ -116,7 +114,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
         self.register_to_config(
             glyph_byT5_v2=glyph_byT5_v2,
-            byt5_max_length=byt5_max_length,
             vision_num_semantic_tokens=vision_num_semantic_tokens,
             vision_states_dim=vision_states_dim,
             flow_shift=flow_shift,
@@ -131,33 +128,29 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             self._progress_bar_config = {}
         self._progress_bar_config.update(progress_bar_config)
 
-        if glyph_byT5_v2:
-            self.byt5_max_length = byt5_max_length
-            self.register_modules(
-                vae=vae,
-                text_encoder=text_encoder,
-                transformer=transformer,
-                scheduler=scheduler,
-                text_encoder_2=text_encoder_2,
-                byt5_model=byt5_model,
-                byt5_tokenizer=byt5_tokenizer,
-            )
-            self.prompt_format = prompt_format
+        self.register_modules(
+            vae=vae,
+            transformer=transformer,
+            scheduler=scheduler,
+            feature_transformer=feature_transformer,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+        )
+        self.byt5_model = None
+        self.byt5_tokenizer = None
+
+        if vae is None:
+            if vae_config is None:
+                raise ValueError("`vae_config` must be provided when `vae` is None.")
+            if isinstance(vae_config, FrozenDict):
+                self.vae_config = vae_config
+            else:
+                self.vae_config = FrozenDict(vae_config)
         else:
-            self.register_modules(
-                vae=vae,
-                text_encoder=text_encoder,
-                transformer=transformer,
-                scheduler=scheduler,
-                text_encoder_2=text_encoder_2,
-            )
-            self.byt5_model = None
-            self.byt5_tokenizer = None
+            self.vae_config = vae.config
 
-
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.vae_scale_factor = 2 ** (len(self.vae_config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
-        self.text_len = text_encoder.max_length
         self.target_dtype = torch.bfloat16
         self.vae_dtype = torch.float16
         self.autocast_enabled = True
@@ -189,226 +182,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             solver="euler",
         )
         return scheduler
-
-    @classmethod
-    def _load_byt5(cls, cached_folder, glyph_byT5_v2, byt5_max_length, device):
-        if not glyph_byT5_v2:
-            byt5_kwargs = None
-            prompt_format = None
-            return byt5_kwargs, prompt_format
-        try:
-            load_from = os.path.join(cached_folder, "text_encoder")
-            glyph_root = os.path.join(load_from, "Glyph-SDXL-v2")
-            if not os.path.exists(glyph_root):
-                raise RuntimeError(
-                    f"Glyph checkpoint not found from '{glyph_root}'. \n"
-                    "Please download from https://modelscope.cn/models/AI-ModelScope/Glyph-SDXL-v2/files.\n\n"
-                    "- Required files:\n"
-                    "    Glyph-SDXL-v2\n"
-                    "    ├── assets\n"
-                    "    │   ├── color_idx.json\n"
-                    "    │   └── multilingual_10-lang_idx.json\n"
-                    "    └── checkpoints\n"
-                    "        └── byt5_model.pt\n"
-                )
-
-            byT5_google_path = os.path.join(load_from, "byt5-small")
-            if not os.path.exists(byT5_google_path):
-                loguru.logger.warning(f"ByT5 google path not found from: {byT5_google_path}. Try downloading from https://huggingface.co/google/byt5-small.")
-                byT5_google_path = "google/byt5-small"
-
-
-            multilingual_prompt_format_color_path = os.path.join(glyph_root, "assets/color_idx.json")
-            multilingual_prompt_format_font_path = os.path.join(glyph_root, "assets/multilingual_10-lang_idx.json")
-
-            byt5_args = dict(
-                byT5_google_path=byT5_google_path,
-                byT5_ckpt_path=os.path.join(glyph_root, "checkpoints/byt5_model.pt"),
-                multilingual_prompt_format_color_path=multilingual_prompt_format_color_path,
-                multilingual_prompt_format_font_path=multilingual_prompt_format_font_path,
-                byt5_max_length=byt5_max_length
-            )
-
-            byt5_kwargs = load_glyph_byT5_v2(byt5_args, device=device)
-            prompt_format = MultilingualPromptFormat(
-                font_path=multilingual_prompt_format_font_path,
-                color_path=multilingual_prompt_format_color_path
-            )
-            return byt5_kwargs, prompt_format
-        except Exception as e:
-            raise RuntimeError("Error loading byT5 glyph processor") from e
-
-
-    def encode_prompt(
-        self,
-        prompt,
-        device,
-        num_videos_per_prompt,
-        do_classifier_free_guidance,
-        negative_prompt=None,
-        prompt_embeds: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        negative_prompt_embeds: Optional[torch.Tensor] = None,
-        negative_attention_mask: Optional[torch.Tensor] = None,
-        clip_skip: Optional[int] = None,
-        text_encoder: Optional[TextEncoder] = None,
-        data_type: Optional[str] = "image",
-    ):
-        r"""
-        Encodes the prompt into text encoder hidden states.
-
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                prompt to be encoded
-            device: (`torch.device`):
-                torch device
-            num_videos_per_prompt (`int`):
-                number of videos that should be generated per prompt
-            do_classifier_free_guidance (`bool`):
-                whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the video generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).
-            prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            attention_mask (`torch.Tensor`, *optional*):
-            negative_prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
-            negative_attention_mask (`torch.Tensor`, *optional*):
-                Attention mask for negative prompt embeddings.
-            clip_skip (`int`, *optional*):
-                Number of layers to be skipped from CLIP while computing the prompt embeddings. A value of 1 means that
-                the output of the pre-final layer will be used for computing the prompt embeddings.
-            text_encoder (TextEncoder, *optional*):
-                Text encoder to use. If None, uses the pipeline's default text encoder.
-            data_type (`str`, *optional*):
-                Type of data being encoded. Defaults to "image".
-        """
-        if text_encoder is None:
-            text_encoder = self.text_encoder
-
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
-        if prompt_embeds is None:
-
-            text_inputs = text_encoder.text2tokens(prompt, data_type=data_type, max_length=self.text_len)
-            if clip_skip is None:
-                prompt_outputs = text_encoder.encode(
-                    text_inputs, data_type=data_type, device=device
-                )
-                prompt_embeds = prompt_outputs.hidden_state
-            else:
-                prompt_outputs = text_encoder.encode(
-                    text_inputs,
-                    output_hidden_states=True,
-                    data_type=data_type,
-                    device=device,
-                )
-                # Access the `hidden_states` first, that contains a tuple of
-                # all the hidden states from the encoder layers. Then index into
-                # the tuple to access the hidden states from the desired layer.
-                prompt_embeds = prompt_outputs.hidden_states_list[-(clip_skip + 1)]
-                # We also need to apply the final LayerNorm here to not mess with the
-                # representations. The `last_hidden_states` that we typically use for
-                # obtaining the final prompt representations passes through the LayerNorm
-                # layer.
-                prompt_embeds = text_encoder.model.text_model.final_layer_norm(
-                    prompt_embeds
-                )
-
-            attention_mask = prompt_outputs.attention_mask
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-                bs_embed, seq_len = attention_mask.shape
-                attention_mask = attention_mask.repeat(1, num_videos_per_prompt)
-                attention_mask = attention_mask.view(
-                    bs_embed * num_videos_per_prompt, seq_len
-                )
-
-        if text_encoder is not None:
-            prompt_embeds_dtype = text_encoder.dtype
-        elif self.transformer is not None:
-            prompt_embeds_dtype = self.transformer.dtype
-        else:
-            prompt_embeds_dtype = prompt_embeds.dtype
-
-        prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
-
-        if prompt_embeds.ndim == 2:
-            bs_embed, _ = prompt_embeds.shape
-            # duplicate text embeddings for each generation per prompt, using mps friendly method
-            prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt)
-            prompt_embeds = prompt_embeds.view(bs_embed * num_videos_per_prompt, -1)
-        else:
-            bs_embed, seq_len, _ = prompt_embeds.shape
-            # duplicate text embeddings for each generation per prompt, using mps friendly method
-            prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-            prompt_embeds = prompt_embeds.view(
-                bs_embed * num_videos_per_prompt, seq_len, -1
-            )
-
-        # get unconditional embeddings for classifier free guidance
-        if do_classifier_free_guidance and negative_prompt_embeds is None:
-            uncond_tokens: List[str]
-            if negative_prompt is None:
-                uncond_tokens = [""] * batch_size
-            elif prompt is not None and type(prompt) is not type(negative_prompt):
-                raise TypeError(
-                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                    f" {type(prompt)}."
-                )
-            elif isinstance(negative_prompt, str):
-                uncond_tokens = [negative_prompt]
-            elif batch_size != len(negative_prompt):
-                raise ValueError(
-                    f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-                    f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-                    " the batch size of `prompt`."
-                )
-            else:
-                uncond_tokens = negative_prompt
-
-            uncond_input = text_encoder.text2tokens(uncond_tokens, data_type=data_type, max_length=self.text_len)
-
-            negative_prompt_outputs = text_encoder.encode(uncond_input, data_type=data_type, is_uncond=True)
-            negative_prompt_embeds = negative_prompt_outputs.hidden_state
-
-            negative_attention_mask = negative_prompt_outputs.attention_mask
-            if negative_attention_mask is not None:
-                negative_attention_mask = negative_attention_mask.to(device)
-                _, seq_len = negative_attention_mask.shape
-                negative_attention_mask = negative_attention_mask.repeat(1, num_videos_per_prompt)
-                negative_attention_mask = negative_attention_mask.view(batch_size * num_videos_per_prompt, seq_len)
-
-        if do_classifier_free_guidance:
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-            seq_len = negative_prompt_embeds.shape[1]
-
-            negative_prompt_embeds = negative_prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
-
-            if negative_prompt_embeds.ndim == 2:
-                negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_videos_per_prompt)
-                negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_videos_per_prompt, -1)
-            else:
-                negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-                negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
-
-        return (
-            prompt_embeds,
-            negative_prompt_embeds,
-            attention_mask,
-            negative_attention_mask,
-        )
-
 
     def prepare_extra_func_kwargs(self, func, kwargs):
         """
@@ -543,139 +316,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
     @property
     def interrupt(self):
         return self._interrupt
-
-    @staticmethod
-    def get_byt5_text_tokens(byt5_tokenizer, byt5_max_length, text_prompt):
-        """
-        Tokenize text prompt for byT5 model.
-
-        Args:
-            byt5_tokenizer: The byT5 tokenizer.
-            byt5_max_length: Maximum sequence length for tokenization.
-            text_prompt: Text prompt string to tokenize.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]:
-                - input_ids: Tokenized input IDs.
-                - attention_mask: Attention mask tensor.
-        """
-        byt5_text_inputs = byt5_tokenizer(
-            text_prompt,
-            padding="max_length",
-            max_length=byt5_max_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-
-        return byt5_text_inputs.input_ids, byt5_text_inputs.attention_mask
-
-    def _extract_glyph_texts(self, prompt):
-        """
-        Extract glyph texts from prompt using regex pattern.
-
-        Args:
-            prompt: Input prompt string containing quoted text.
-
-        Returns:
-            List[str]: List of extracted glyph texts (deduplicated if multiple).
-        """
-        pattern = r'\"(.*?)\"|“(.*?)”'
-        matches = re.findall(pattern, prompt)
-        result = [match[0] or match[1] for match in matches]
-        result = list(dict.fromkeys(result)) if len(result) > 1 else result
-        return result
-
-    def _process_single_byt5_prompt(self, prompt_text, device):
-        """
-        Process a single prompt for byT5 encoding.
-
-        Args:
-            prompt_text: The prompt text to process.
-            device: Target device for tensors.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor]:
-                - byt5_embeddings: Encoded embeddings tensor.
-                - byt5_mask: Attention mask tensor.
-        """
-        byt5_embeddings = torch.zeros((1, self.byt5_max_length, 1472), device=device)
-        byt5_mask = torch.zeros((1, self.byt5_max_length), device=device, dtype=torch.int64)
-        
-        glyph_texts = self._extract_glyph_texts(prompt_text)
-        
-        if len(glyph_texts) > 0:
-            text_styles = [{'color': None, 'font-family': None} for _ in range(len(glyph_texts))]
-            formatted_text = self.prompt_format.format_prompt(glyph_texts, text_styles)
-            
-            text_ids, text_mask = self.get_byt5_text_tokens(
-                self.byt5_tokenizer, self.byt5_max_length, formatted_text
-            )
-            text_ids = text_ids.to(device=device)
-            text_mask = text_mask.to(device=device)
-            
-            byt5_outputs = self.byt5_model(text_ids, attention_mask=text_mask.float())
-            byt5_embeddings = byt5_outputs[0]
-            byt5_mask = text_mask
-            
-        return byt5_embeddings, byt5_mask
-
-    def _prepare_byt5_embeddings(self, prompts, device):
-        """
-        Prepare byT5 embeddings for both positive and negative prompts.
-
-        Args:
-            prompts: List of prompt strings or single prompt string.
-            device: Target device for tensors.
-
-        Returns:
-            dict: Dictionary containing:
-                - "byt5_text_states": Combined embeddings tensor.
-                - "byt5_text_mask": Combined attention mask tensor.
-                Returns empty dict if glyph_byT5_v2 is disabled.
-        """
-        if not self.config.glyph_byT5_v2:
-            return {}
-            
-        if isinstance(prompts, str):
-            prompt_list = [prompts]
-        elif isinstance(prompts, list):
-            prompt_list = prompts
-        else:
-            raise ValueError("prompts must be str or list of str")
-
-        positive_embeddings = []
-        positive_masks = []
-        negative_embeddings = []
-        negative_masks = []
-
-        for prompt in prompt_list:
-            pos_emb, pos_mask = self._process_single_byt5_prompt(prompt, device)
-            positive_embeddings.append(pos_emb)
-            positive_masks.append(pos_mask)
-
-            if self.do_classifier_free_guidance:
-                neg_emb, neg_mask = self._process_single_byt5_prompt("", device)
-                negative_embeddings.append(neg_emb)
-                negative_masks.append(neg_mask)
-
-        byt5_positive = torch.cat(positive_embeddings, dim=0)
-        byt5_positive_mask = torch.cat(positive_masks, dim=0)
-        
-        if self.do_classifier_free_guidance:
-            byt5_negative = torch.cat(negative_embeddings, dim=0)
-            byt5_negative_mask = torch.cat(negative_masks, dim=0)
-            
-            byt5_embeddings = torch.cat([byt5_negative, byt5_positive], dim=0)
-            byt5_masks = torch.cat([byt5_negative_mask, byt5_positive_mask], dim=0)
-        else:
-            byt5_embeddings = byt5_positive
-            byt5_masks = byt5_positive_mask
-
-        return {
-            "byt5_text_states": byt5_embeddings,
-            "byt5_text_mask": byt5_masks
-        }
 
     def extract_image_features(self, reference_image):
         """
@@ -850,7 +490,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             
             with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=True):
                 cond_latents = self.vae.encode(ref_images_pixel_values).latent_dist.mode()
-                cond_latents.mul_(self.vae.config.scaling_factor)
+                cond_latents.mul_(self.vae_config.scaling_factor)
             
         else:
             raise ValueError(f"Unsupported task_type: {task_type}. Must be 't2v' or 'i2v'")
@@ -859,15 +499,15 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
     @property
     def vae_spatial_compression_ratio(self):
-        if hasattr(self.vae.config, "ffactor_spatial"):
-            return self.vae.config.ffactor_spatial
+        if hasattr(self.vae_config, "ffactor_spatial"):
+            return self.vae_config.ffactor_spatial
         else:
             return 16
 
     @property
     def vae_temporal_compression_ratio(self):
-        if hasattr(self.vae.config, "ffactor_temporal"):
-            return self.vae.config.ffactor_temporal
+        if hasattr(self.vae_config, "ffactor_temporal"):
+            return self.vae_config.ffactor_temporal
         else:
             return 4
 
@@ -883,7 +523,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
 
     @torch.no_grad()
-    def __call__(
+    def forward_motion_generator(
         self,
         prompt: Union[str, List[str]],
         aspect_ratio: str,
@@ -891,17 +531,16 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         prompt_rewrite: bool = True,
         num_inference_steps: int = None,
         guidance_scale: Optional[float] = None,
-        enable_sr: bool = True,
-        sr_num_inference_steps: Optional[int] = None,
-        negative_prompt: Optional[Union[str, List[str]]] = None,
+        enable_sr: bool = False,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         seed: Optional[int] = None,
         flow_shift: Optional[float] = None,
         embedded_guidance_scale: Optional[float] = None,
         reference_image=None,  # For i2v tasks: PIL Image or path to image file
+        action_states: Optional[torch.Tensor] = None,
         output_type: Optional[str] = "pt",
         return_dict: bool = True,
-        return_pre_sr_video: bool = False,
+        return_pre_sr_video: bool = True,
         enable_vae_tile_parallelism: bool = True,
         **kwargs,
     ):
@@ -935,6 +574,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 Additional control guidance scale, if supported.
             reference_image (PIL.Image or `str`, *optional*):
                 Reference image for image-to-video (i2v) tasks. Can be a PIL image or a path to an image file. Set to `None` for text-to-video (t2v) generation.
+            action_states (`torch.Tensor`, *optional*):
+                Motion conditioning tensor with shape `(B, T, J, D)` or `(T, J, D)`.
             output_type (`str`, *optional*, defaults to "pt"):
                 Output format of the returned video(s). Accepted values: `"pt"` for torch.Tensor or `"np"` for numpy.ndarray.
             return_dict (`bool`, *optional*, defaults to True):
@@ -959,7 +600,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             ```
         """
         num_videos_per_prompt = 1
-        target_resolution = self.ideal_resolution
+        target_resolution = kwargs.get("target_resolution", self.ideal_resolution)
+        if target_resolution is not None and target_resolution not in self.target_size_config:
+            supported = ", ".join(self.target_size_config.keys())
+            raise ValueError(
+                f"Unsupported target_resolution: {target_resolution}. Supported values: {supported}"
+            )
 
         if guidance_scale is None:
             guidance_scale = self.config.guidance_scale
@@ -991,23 +637,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             task_type = "t2v"
             semantic_images_np = None
 
-        if prompt_rewrite:
-            from hyvideo.utils.rewrite.rewrite_utils import run_prompt_rewrite
-
-            if not dist.is_initialized() or get_parallel_state().sp_rank == 0:
-                try:
-                    prompt = run_prompt_rewrite(user_prompt, reference_image, task_type)
-                except Exception as e:
-                    loguru.logger.warning(f"Failed to rewrite prompt: {e}")
-                    prompt = user_prompt
-                
-            if dist.is_initialized() and get_parallel_state().sp_enabled:
-                obj_list = [prompt]
-                # not use group_src to support old PyTorch
-                group_src_rank = dist.get_global_rank(get_parallel_state().sp_group, 0)
-                dist.broadcast_object_list(obj_list, src=group_src_rank, group=get_parallel_state().sp_group)
-                prompt = obj_list[0]
-
         if self.ideal_task is not None and self.ideal_task != task_type:
             raise ValueError(
                 f"The loaded pipeline is trained for '{self.ideal_task}' task, but received input for '{task_type}' task. "
@@ -1035,12 +664,13 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
         if reference_image is not None:
             if self.ideal_resolution is not None and target_resolution != self.ideal_resolution:
-                raise ValueError(
-                    f'The loaded pipeline is trained for {self.ideal_resolution} resolution, but received input for {target_resolution} resolution. '
-                )
+                # raise ValueError(
+                #     f'The loaded pipeline is trained for {self.ideal_resolution} resolution, but received input for {target_resolution} resolution. '
+                # )
+                loguru.logger.warning(f'The loaded pipeline is trained for {self.ideal_resolution} resolution, but received input for {target_resolution} resolution. ')
             height, width = self.get_closest_resolution_given_reference_image(reference_image, target_resolution)
         else:
-            if self.ideal_resolution is not None:
+            if target_resolution is not None:
                 if ":" not in aspect_ratio:
                     raise ValueError("aspect_ratio must be separated by a colon")
                 width, height = aspect_ratio.split(":")
@@ -1049,9 +679,9 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     raise ValueError("width and height must be positive integers and separated by a colon in aspect_ratio")
                 width = int(width)
                 height = int(height)
-                height, width = self.get_closest_resolution_given_original_size((width, height), self.ideal_resolution)
+                height, width = self.get_closest_resolution_given_original_size((width, height), target_resolution)
             else:
-                raise ValueError("ideal_resolution is not set")
+                raise ValueError("target_resolution is not set")
 
         latent_target_length, latent_height, latent_width = self.get_latent_size(video_length, height, width)
         n_tokens = latent_target_length * latent_height * latent_width
@@ -1069,6 +699,24 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         else:
             batch_size = 1
         device = self.execution_device
+
+        if action_states is None:
+            raise ValueError("`action_states` must be provided for motion-conditioned generation.")
+
+        actions = action_states if torch.is_tensor(action_states) else torch.as_tensor(action_states)
+        if actions.ndim == 3:
+            actions = actions.unsqueeze(0)
+        elif actions.ndim != 4:
+            raise ValueError(
+                f"`action_states` must have shape (T, J, D) or (B, T, J, D), got {tuple(actions.shape)}"
+            )
+
+        if actions.shape[0] != batch_size:
+            raise ValueError(
+                f"Batch size mismatch: prompt batch is {batch_size}, but `action_states` batch is {actions.shape[0]}"
+            )
+
+        actions = actions.to(device=device, dtype=torch.float32)
 
         if get_rank() == 0:
             print(
@@ -1094,60 +742,60 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 '\n'
             )
 
-        with auto_offload_model(self.text_encoder, self.execution_device, enabled=self.enable_offloading):
-            (
-                prompt_embeds,
-                negative_prompt_embeds,
-                prompt_mask,
-                negative_prompt_mask,
-            ) = self.encode_prompt(
-                prompt,
-                device,
-                num_videos_per_prompt,
-                self.do_classifier_free_guidance,
-                negative_prompt,
-                clip_skip=self.clip_skip,
-                data_type="video",
-            )
-
-
-        # Encode prompts with second encoder if available
-        if self.text_encoder_2 is not None:
-            with auto_offload_model(self.text_encoder_2, self.execution_device, enabled=self.enable_offloading):
-                (
-                    prompt_embeds_2,
-                    negative_prompt_embeds_2,
-                    prompt_mask_2,
-                    negative_prompt_mask_2,
-                ) = self.encode_prompt(
-                    prompt,
-                    device,
-                    num_videos_per_prompt,
-                    self.do_classifier_free_guidance,
-                    negative_prompt,
-                    clip_skip=self.clip_skip,
-                    text_encoder=self.text_encoder_2,
-                    data_type="video",
-                )
-        else:
-            prompt_embeds_2 = None
-            negative_prompt_embeds_2 = None
-            prompt_mask_2 = None
-            negative_prompt_mask_2 = None
+        # Use precomputed dummy text states for motion generation, without runtime text encoding.
+        text_batch_size = batch_size * num_videos_per_prompt
+        empty_text_states = torch.load(
+            os.path.join("ckpts", "empty_prompts", "empty_text_states.pt"),
+            map_location="cpu",
+        )
+        empty_text_masks = torch.load(
+            os.path.join("ckpts", "empty_prompts", "empty_text_masks.pt"),
+            map_location="cpu",
+        )
+        prompt_embeds = empty_text_states.unsqueeze(0).expand(text_batch_size, -1, -1).to(
+            device=device,
+            dtype=self.target_dtype,
+        )
+        prompt_mask = empty_text_masks.unsqueeze(0).expand(text_batch_size, -1).to(
+            device=device,
+            dtype=torch.long,
+        )
+        prompt_embeds_2 = None
+        prompt_mask_2 = None
 
         extra_kwargs = {}
         if self.config.glyph_byT5_v2:
-            with auto_offload_model(self.byt5_model, self.execution_device, enabled=self.enable_offloading):
-                extra_kwargs = self._prepare_byt5_embeddings(prompt, device)
+            empty_byt5_states = torch.load(
+                os.path.join("ckpts", "empty_prompts", "empty_byt5_states.pt"), map_location="cpu",
+            )
+            empty_byt5_masks = torch.load(
+                os.path.join("ckpts", "empty_prompts", "empty_byt5_masks.pt"), map_location="cpu",
+            )
+            byt5_text_states = empty_byt5_states.unsqueeze(0).expand(text_batch_size, -1, -1).to(
+                device=device,
+                dtype=self.target_dtype,
+            )
+            byt5_text_mask = empty_byt5_masks.unsqueeze(0).expand(text_batch_size, -1).to(
+                device=device,
+                dtype=torch.long,
+            )
+            extra_kwargs = {
+                "byt5_text_states": byt5_text_states,
+                "byt5_text_mask": byt5_text_mask,
+            }
 
         if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+            # For CFG unconditional branch, reuse the same prompt-side conditioning.
+            prompt_embeds = torch.cat([prompt_embeds, prompt_embeds], dim=0)
             if prompt_mask is not None:
-                prompt_mask = torch.cat([negative_prompt_mask, prompt_mask])
+                prompt_mask = torch.cat([prompt_mask, prompt_mask], dim=0)
             if prompt_embeds_2 is not None:
-                prompt_embeds_2 = torch.cat([negative_prompt_embeds_2, prompt_embeds_2])
+                prompt_embeds_2 = torch.cat([prompt_embeds_2, prompt_embeds_2], dim=0)
             if prompt_mask_2 is not None:
-                prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
+                prompt_mask_2 = torch.cat([prompt_mask_2, prompt_mask_2], dim=0)
+            if extra_kwargs:
+                extra_kwargs["byt5_text_states"] = torch.cat([extra_kwargs["byt5_text_states"], extra_kwargs["byt5_text_states"]], dim=0)
+                extra_kwargs["byt5_text_mask"] = torch.cat([extra_kwargs["byt5_text_mask"], extra_kwargs["byt5_text_mask"]], dim=0)
 
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.set_timesteps, {"n_tokens": n_tokens}
@@ -1182,6 +830,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             vision_states = self._prepare_vision_states(
                 semantic_images_np, target_resolution, latents, device
             )
+
+        if self.do_classifier_free_guidance:
+            actions_input = torch.cat([torch.zeros_like(actions), actions], dim=0)
+        else:
+            actions_input = actions
 
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step, {"generator": generator, "eta": kwargs.get("eta", 0.0)},
@@ -1226,17 +879,17 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
                 with torch.autocast(device_type="cuda", dtype=self.target_dtype, enabled=self.autocast_enabled):
                     output = self.transformer(
-                        latent_model_input,
-                        t_expand,
-                        prompt_embeds,
-                        prompt_embeds_2,
-                        prompt_mask,
+                        hidden_states=latent_model_input,
+                        action_states=actions_input,
+                        timestep=t_expand,
+                        text_states=prompt_embeds,
+                        text_states_2=prompt_embeds_2,
+                        encoder_attention_mask=prompt_mask.to(dtype=self.target_dtype),
                         timestep_r=timesteps_r,
                         vision_states=vision_states,
                         mask_type=task_type,
-                        guidance=guidance_expand,
+                        extra_kwargs=extra_kwargs if extra_kwargs else None,
                         return_dict=False,
-                        extra_kwargs=extra_kwargs,
                     )
                     noise_pred = output[0]
 
@@ -1259,23 +912,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     if progress_bar is not None:
                         progress_bar.update()
 
-        if enable_sr:
-            assert hasattr(self, 'sr_pipeline')
-            sr_out = self.sr_pipeline(
-                prompt=prompt,
-                num_inference_steps=sr_num_inference_steps,
-
-                video_length=video_length,
-                negative_prompt="",
-                num_videos_per_prompt=num_videos_per_prompt,
-                seed=seed,
-                output_type=output_type,
-
-                lq_latents=latents,
-                reference_image=user_reference_image,
-                enable_vae_tile_parallelism=enable_vae_tile_parallelism,
-            )
-
         if output_type == "latent":
             video_frames = latents
         else:
@@ -1286,10 +922,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {latents.shape}."
                 )
 
-            if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
-                latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
+            if hasattr(self.vae_config, "shift_factor") and self.vae_config.shift_factor:
+                latents = latents / self.vae_config.scaling_factor + self.vae_config.shift_factor
             else:
-                latents = latents / self.vae.config.scaling_factor
+                latents = latents / self.vae_config.scaling_factor
 
             if enable_vae_tile_parallelism and hasattr(self.vae, 'enable_tile_parallelism'):
                 self.vae.enable_tile_parallelism()
@@ -1302,23 +938,16 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     video_frames = (video_frames / 2 + 0.5).clamp(0, 1).cpu().float()
                     
             else:
-                video_frames = sr_out.videos
+                video_frames = None
 
         # Offload all models
         self.maybe_free_model_hooks()
-        if enable_sr:
-            sr_video_frames = sr_out.videos
 
         if not return_dict:
             ret = video_frames
-            if enable_sr:
-                ret = (video_frames, sr_video_frames)
             return ret
 
-        if enable_sr:
-            return HunyuanVideoPipelineOutput(videos=video_frames, sr_videos=sr_video_frames)
-        else:
-            return HunyuanVideoPipelineOutput(videos=video_frames)
+        return HunyuanVideoPipelineOutput(videos=video_frames)
 
     @property
     def ideal_resolution(self):
@@ -1412,42 +1041,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 group_offloading_kwargs['use_stream'] = True
             self.transformer.enable_group_offload(**group_offloading_kwargs)
 
-    @classmethod
-    def load_sr_transformer_upsampler(cls, cached_folder, sr_version, transformer_dtype=torch.bfloat16, device=None):
-        transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
-            os.path.join(cached_folder, "transformer", sr_version), 
-            low_cpu_mem_usage=True, 
-            torch_dtype=transformer_dtype
-        ).to(device)
-        upsampler_cls = SRTo720pUpsampler if "720p" in sr_version else SRTo1080pUpsampler
-        upsampler = upsampler_cls.from_pretrained(os.path.join(cached_folder, "upsampler", sr_version)).to(device)
-        return transformer, upsampler
-
-    def create_sr_pipeline(self, cached_folder, sr_version, transformer_dtype=torch.bfloat16, device=None):
-        from .hunyuan_video_sr_pipeline import HunyuanVideo_1_5_SR_Pipeline
-
-
-        transformer, upsampler = self.load_sr_transformer_upsampler(cached_folder, sr_version, transformer_dtype=transformer_dtype, device=device)
-
-        return HunyuanVideo_1_5_SR_Pipeline(
-            vae=self.vae,
-            transformer=transformer,
-            text_encoder=self.text_encoder,
-            scheduler=self.scheduler,
-            upsampler=upsampler,
-            text_encoder_2=self.text_encoder_2,
-            progress_bar_config=None,
-            glyph_byT5_v2=self.config.glyph_byT5_v2,
-            byt5_model=self.byt5_model,
-            byt5_tokenizer=self.byt5_tokenizer,
-            byt5_max_length=self.byt5_max_length,
-            prompt_format=self.prompt_format,
-            execution_device='cuda',
-            vision_encoder=self.vision_encoder,
-            enable_offloading=self.enable_offloading,
-            **SR_PIPELINE_CONFIGS[sr_version],
-        )
-
     @staticmethod
     def get_transformer_version(resolution, task, cfg_distilled=False, step_distilled=False, sparse_attn=False):
         # Build transformer_version based on flags
@@ -1464,7 +1057,20 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         return transformer_version
 
     @classmethod
-    def create_pipeline(cls, pretrained_model_name_or_path, transformer_version, create_sr_pipeline=False, transformer_dtype=torch.bfloat16, device=None, transformer_init_device=None, **kwargs):
+    def create_pipeline(
+        cls, 
+        pretrained_model_name_or_path, 
+        transformer_version, 
+        action_decoder_config_path=None, 
+        action_encoder_config_path=None, 
+        create_feature_transformer=False,
+        create_motion_transformer=False,
+        create_vae=False,
+        create_vision_encoder=False,
+        transformer_dtype=torch.bfloat16, 
+        device=None, 
+        transformer_init_device=None, 
+    ):
         # use snapshot download here to get it working from from_pretrained
 
         if not os.path.isdir(pretrained_model_name_or_path):
@@ -1473,10 +1079,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     f'The provided pretrained_model_name_or_path "{pretrained_model_name_or_path}"'
                     " is neither a valid local path nor a valid repo id. Please check the parameter."
                 )
-            cached_folder = cls.download(
-                pretrained_model_name_or_path,
-                **kwargs,
-            )
         else:
             cached_folder = pretrained_model_name_or_path
 
@@ -1502,47 +1104,67 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             from_pretrain_kwargs ={
                 'pretrained_model_name_or_path': os.path.join(cached_folder, "transformer", transformer_version),
             }
+            if action_decoder_config_path is not None:
+                action_decoder_config_path = os.path.join(cached_folder, action_decoder_config_path)
+            if action_encoder_config_path is not None:
+                action_encoder_config_path = os.path.join(cached_folder, action_encoder_config_path)
+        
+        transformer = None
+        if create_motion_transformer:
+            transformer = HunyuanVideo_1_5_MotionTransformer.from_pretrained(
+                **from_pretrain_kwargs,
+                torch_dtype=transformer_dtype, 
+                low_cpu_mem_usage=True,
+            )
+            transformer.init_extra_modules_from_config(extra_cfg_path=action_encoder_config_path)
+            transformer = transformer.to(transformer_init_device)
 
-        vae_inference_config = cls.get_vae_inference_config()
-        transformer = HunyuanVideo_1_5_DiffusionTransformer.from_pretrained(
-            **from_pretrain_kwargs,
-            torch_dtype=transformer_dtype, 
-            low_cpu_mem_usage=True,
-        ).to(transformer_init_device)
+        feature_transformer = None
+        if create_feature_transformer:
+            feature_transformer = HunyuanVideo_1_5_FeatureTransformer.from_pretrained(
+                **from_pretrain_kwargs,
+                torch_dtype=transformer_dtype,
+                low_cpu_mem_usage=True,
+            )
+            feature_transformer.init_extra_modules_from_config(extra_cfg_path=action_decoder_config_path)
+            feature_transformer = feature_transformer.to(transformer_init_device)
 
-        vae = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(
-            os.path.join(cached_folder, "vae"), 
-            torch_dtype=vae_inference_config['dtype']
-        ).to(device)
-        vae.set_tile_sample_min_size(vae_inference_config['sample_size'], vae_inference_config['tile_overlap_factor'])
+        vae = None
+        vae_config = None
+        if create_vae:
+            vae_inference_config = cls.get_vae_inference_config()
+            vae = hunyuanvideo_15_vae.AutoencoderKLConv3D.from_pretrained(
+                os.path.join(cached_folder, "vae"), 
+                torch_dtype=vae_inference_config['dtype']
+            ).to(device)
+            vae.set_tile_sample_min_size(vae_inference_config['sample_size'], vae_inference_config['tile_overlap_factor'])
+        else:
+            vae_config_path = os.path.join(cached_folder, "vae", "config.json")
+            if not os.path.exists(vae_config_path):
+                raise FileNotFoundError(
+                    f"{vae_config_path} not found. Please provide a valid VAE config path."
+                )
+            with open(vae_config_path, "r", encoding="utf-8") as f:
+                vae_config = json.load(f)
+
         scheduler = FlowMatchDiscreteScheduler.from_pretrained(os.path.join(cached_folder, "scheduler"))
 
-        byt5_kwargs, prompt_format = cls._load_byt5(cached_folder, True, 256, device=device)
-        text_encoder, text_encoder_2 = cls._load_text_encoders(cached_folder, device=device)
-        vision_encoder = cls._load_vision_encoder(cached_folder, device=device)
+        vision_encoder = None
+        if create_vision_encoder:
+            vision_encoder = cls._load_vision_encoder(cached_folder, device=device)
 
         pipeline = cls(
             vae=vae,
-            text_encoder=text_encoder,
             transformer=transformer,
+            feature_transformer=feature_transformer,
             scheduler=scheduler,
-            text_encoder_2=text_encoder_2,
+            vae_config=vae_config,
             progress_bar_config=None,
-            byt5_model=byt5_kwargs["byt5_model"],
-            byt5_tokenizer=byt5_kwargs["byt5_tokenizer"],
-            byt5_max_length=byt5_kwargs["byt5_max_length"],
-            prompt_format=prompt_format,
             execution_device='cuda',
             vision_encoder=vision_encoder,
             enable_offloading=False,
             **PIPELINE_CONFIGS[transformer_version],
         )
-
-        if create_sr_pipeline:
-            sr_version = TRANSFORMER_VERSION_TO_SR_VERSION[transformer_version]
-            sr_pipeline = pipeline.create_sr_pipeline(cached_folder, sr_version, transformer_dtype=transformer_dtype, device=device)
-            pipeline.sr_pipeline = sr_pipeline
-
 
         return pipeline
 
@@ -1576,32 +1198,6 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             tile_overlap_factor = 0.25
             dtype = torch.float16
         return {'sample_size': sample_size, 'tile_overlap_factor': tile_overlap_factor, 'dtype': dtype}
-
-
-    @classmethod
-    def _load_text_encoders(cls, pretrained_model_path, device):
-        text_encoder_path = f'{pretrained_model_path}/text_encoder/llm'
-        if not os.path.exists(text_encoder_path):
-            msg = f"{text_encoder_path} not found. Please refer to checkpoints-download.md to download the text encoder checkpoints."
-            loguru.logger.error(msg)
-            raise FileNotFoundError(msg)
-        text_encoder = TextEncoder(
-            text_encoder_type='llm',
-            tokenizer_type='llm',
-            text_encoder_path=text_encoder_path,
-            max_length=1000,
-            text_encoder_precision="fp16",
-            prompt_template=PROMPT_TEMPLATE['li-dit-encode-image-json'],
-            prompt_template_video=PROMPT_TEMPLATE['li-dit-encode-video-json'],
-            hidden_state_skip_layer=2,
-            apply_final_norm=False,
-            reproduce=False,
-            logger=loguru.logger,
-            device=device,
-        )
-        text_encoder_2 = None
-
-        return text_encoder, text_encoder_2
 
     @classmethod
     def _load_vision_encoder(cls, pretrained_model_name_or_path, device):

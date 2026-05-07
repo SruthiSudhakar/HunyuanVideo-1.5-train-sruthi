@@ -20,6 +20,19 @@ from einops import rearrange
 def flash_attn_no_pad(
     qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False
 ):
+    
+    # If there is no padding mask, do NOT go through unpad/pad path.
+    if key_padding_mask is None:
+        from flash_attn import flash_attn_qkvpacked_func
+        # qkv: (B, S, 3, H, D) -> output: (B, S, H, D)
+        return flash_attn_qkvpacked_func(
+            qkv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            deterministic=deterministic,
+        )
+    
     from flash_attn import flash_attn_varlen_qkvpacked_func
     from flash_attn.bert_padding import pad_input, unpad_input
     batch_size = qkv.shape[0]
@@ -52,6 +65,18 @@ def flash_attn_no_pad(
 def flash_attn_no_pad_v3(
     qkv, key_padding_mask, causal=False, dropout_p=0.0, softmax_scale=None, deterministic=False
 ):
+    
+    if key_padding_mask is None:
+        # simplest reliable behavior: use v2 packed kernel
+        from flash_attn import flash_attn_qkvpacked_func
+        return flash_attn_qkvpacked_func(
+            qkv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            deterministic=deterministic,
+        )
+    
     from flash_attn import flash_attn_varlen_qkvpacked_func
     from flash_attn.bert_padding import pad_input, unpad_input
     from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3

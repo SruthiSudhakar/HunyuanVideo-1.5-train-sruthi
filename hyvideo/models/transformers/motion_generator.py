@@ -30,17 +30,20 @@ from hyvideo.commons import maybe_fallback_attn_mode
 from .modules.activation_layers import get_activation_layer
 from .modules.norm_layers import get_norm_layer
 from .modules.embed_layers import TimestepEmbedder, PatchEmbed, TextProjection, VisionProjection
-from .modules.attention import parallel_attention
-from .modules.posemb_layers import apply_rotary_emb, get_nd_rotary_pos_embed
+from .modules.attention import parallel_attention, double_stream_sequence_parallel_attention, single_stream_sequence_parallel_attention
+from .modules.posemb_layers import apply_rotary_emb, apply_rotary_emb_single, get_nd_rotary_pos_embed
 from .modules.mlp_layers import MLP, MLPEmbedder, FinalLayer, LinearWarpforSingle
 from .modules.modulate_layers import ModulateDiT, modulate, apply_gate
 from .modules.token_refiner import SingleTokenRefiner
+from .modules.action_modules import ActionEncodingInit, ActionSelfAttnBlock
 
 from hyvideo.utils.communications import all_gather
 from hyvideo.models.text_encoders.byT5 import ByT5Mapper
 from hyvideo.commons.parallel_states import get_parallel_state
 from diffusers.loaders.peft import PeftAdapterMixin
 
+import json
+from pathlib import Path
 
 class MMDoubleStreamBlock(nn.Module):
 
@@ -61,10 +64,13 @@ class MMDoubleStreamBlock(nn.Module):
         super().__init__()
 
         self.deterministic = False
+        self.hidden_size = hidden_size
         self.heads_num = heads_num
+        self.qkv_bias = qkv_bias
         self.attn_mode = attn_mode
 
         head_dim = hidden_size // heads_num
+        self.head_dim = head_dim
         mlp_hidden_dim = int(hidden_size * mlp_width_ratio)
 
         self.img_mod = ModulateDiT(
@@ -106,6 +112,21 @@ class MMDoubleStreamBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
         self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, act_layer=get_activation_layer(mlp_act_type), bias=True, **factory_kwargs)
 
+        self.action_hidden_size = None
+        self.action_xattn_heads_num = None
+        self.action_xattn_hidden_size = None
+        self.action_xattn_proj_size = None
+        self.action_xattn_img_norm = None
+        self.action_xattn_action_norm = None
+        self.action_xattn_q = None
+        self.action_xattn_k = None
+        self.action_xattn_v = None
+        self.action_xattn_q_norm = None
+        self.action_xattn_k_norm = None
+        self.action_xattn_proj = None
+        self.action_xattn_gate = None
+        self.action_xattn_mod = None
+
         self.hybrid_seq_parallel_attn = None
 
     def enable_deterministic(self):
@@ -114,17 +135,98 @@ class MMDoubleStreamBlock(nn.Module):
     def disable_deterministic(self):
         self.deterministic = False
 
+    def init_action_cross_attn(
+        self,
+        action_hidden_size: int,
+        qk_norm: bool = True,
+        qk_norm_type: str = "rms",
+        qkv_bias: bool = False,
+    ) -> None:
+
+        ref_weight = self.img_attn_q.weight
+        factory_kwargs = {"device": ref_weight.device, "dtype": ref_weight.dtype}
+        qk_norm_layer = get_norm_layer(qk_norm_type)
+
+        if self.heads_num % 2 != 0:
+            raise ValueError(f"Expected even heads_num for action cross-attn, got heads_num={self.heads_num}.")
+
+        self.action_xattn_heads_num = self.heads_num // 2
+        self.action_xattn_hidden_size = self.action_xattn_heads_num * self.head_dim
+        self.action_xattn_proj_size = self.hidden_size // 2
+        if self.action_xattn_proj_size <= 0:
+            raise ValueError(f"Invalid action_xattn_proj_size={self.action_xattn_proj_size} for hidden_size={self.hidden_size}.")
+
+        self.action_hidden_size = action_hidden_size
+
+        self.action_xattn_img_norm = nn.LayerNorm(self.hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
+        self.action_xattn_action_norm = nn.LayerNorm(action_hidden_size, elementwise_affine=True, eps=1e-6, **factory_kwargs)
+        self.action_xattn_q = nn.Linear(self.hidden_size, self.action_xattn_hidden_size, bias=qkv_bias, **factory_kwargs)
+        self.action_xattn_k = nn.Linear(action_hidden_size, self.action_xattn_hidden_size, bias=qkv_bias, **factory_kwargs)
+        self.action_xattn_v = nn.Linear(action_hidden_size, self.action_xattn_hidden_size, bias=qkv_bias, **factory_kwargs)
+        self.action_xattn_q_norm = (
+            qk_norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
+        )
+        self.action_xattn_k_norm = (
+            qk_norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
+        )
+
+        self.action_xattn_gate = nn.Linear(self.hidden_size, self.action_xattn_hidden_size, bias=True, **factory_kwargs)
+
+        self.action_xattn_proj = nn.Linear(self.action_xattn_hidden_size, self.action_xattn_proj_size, bias=qkv_bias, **factory_kwargs)
+        self.action_xattn_mod = nn.Linear(self.action_xattn_proj_size, 6 * self.hidden_size, bias=True, **factory_kwargs)
+        # nn.init.normal_(self.action_xattn_mod.weight, std=1e-3)
+        # nn.init.zeros_(self.action_xattn_mod.bias)
+        nn.init.zeros_(self.action_xattn_mod.weight)
+        nn.init.zeros_(self.action_xattn_mod.bias)
+
     def forward(
         self,
         img: torch.Tensor,
         txt: torch.Tensor,
+        action: torch.Tensor,
         vec: torch.Tensor,
         freqs_cis: tuple = None,
-        text_mask=None,
-        attn_param=None,
-        is_flash=False,
-        block_idx=None,
+        freqs_cis_action: tuple = None,
+        action_is_fully_gathered: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        
+        img_action_normed = self.action_xattn_img_norm(img)
+        action_normed = self.action_xattn_action_norm(action)
+
+        img_action_q = self.action_xattn_q(img_action_normed)
+        img_action_k = self.action_xattn_k(action_normed)
+        img_action_v = self.action_xattn_v(action_normed)
+        img_action_gate = self.action_xattn_gate(img_action_normed)
+
+        img_action_q = rearrange(img_action_q, "B L (H D) -> B L H D", H=self.action_xattn_heads_num)
+        img_action_k = rearrange(img_action_k, "B L (H D) -> B L H D", H=self.action_xattn_heads_num)
+        img_action_v = rearrange(img_action_v, "B L (H D) -> B L H D", H=self.action_xattn_heads_num)
+        img_action_q = self.action_xattn_q_norm(img_action_q).to(img_action_v)
+        img_action_k = self.action_xattn_k_norm(img_action_k).to(img_action_v)
+
+        img_action_qq = apply_rotary_emb_single(img_action_q, freqs_cis, head_first=False)
+        img_action_kk = apply_rotary_emb_single(img_action_k, freqs_cis_action, head_first=False)
+        assert (
+            img_action_qq.shape == img_action_q.shape and img_action_kk.shape == img_action_k.shape
+        ), (
+            f"img_action_qq: {img_action_qq.shape}, img_action_q: {img_action_q.shape}, "
+            f"img_action_kk: {img_action_kk.shape}, img_action_k: {img_action_k.shape}"
+        )
+        img_action_q, img_action_k = img_action_qq, img_action_kk
+
+        img_action_attn = single_stream_sequence_parallel_attention(
+            img_action_q,
+            img_action_k,
+            img_action_v,
+            mode="cross_full",
+            k_is_fully_gathered=action_is_fully_gathered,
+            v_is_fully_gathered=action_is_fully_gathered,
+        )
+        
+        img_action_attn = img_action_attn * torch.sigmoid(img_action_gate).to(img_action_attn)
+        
+        action_mod = self.action_xattn_mod(self.action_xattn_proj(img_action_attn))
+        mods = self.img_mod(vec).unsqueeze(1) + action_mod
         (
             img_mod1_shift,
             img_mod1_scale,
@@ -132,7 +234,7 @@ class MMDoubleStreamBlock(nn.Module):
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = self.img_mod(vec).chunk(6, dim=-1)
+        ) = mods.chunk(6, dim=-1)
 
         (
             txt_mod1_shift,
@@ -144,7 +246,7 @@ class MMDoubleStreamBlock(nn.Module):
         ) = self.txt_mod(vec).chunk(6, dim=-1)
 
         img_modulated = self.img_norm1(img)
-        img_modulated = modulate(img_modulated, shift=img_mod1_shift, scale=img_mod1_scale)
+        img_modulated = img_modulated * (1 + img_mod1_scale) + img_mod1_shift
 
         img_q = self.img_attn_q(img_modulated)
         img_k = self.img_attn_k(img_modulated)
@@ -173,28 +275,18 @@ class MMDoubleStreamBlock(nn.Module):
         txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
         txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
 
-        attn_mode = 'flash' if is_flash else self.attn_mode
-        attn = parallel_attention(
+        attn = double_stream_sequence_parallel_attention(
             (img_q, txt_q),
             (img_k, txt_k),
             (img_v, txt_v),
-            img_q_len=img_q.shape[1],
-            img_kv_len=img_k.shape[1],
-            text_mask=text_mask,
-            attn_mode=attn_mode,
-            attn_param=attn_param,
-            block_idx=block_idx,
         )
 
         img_attn, txt_attn = attn[:, :img_q.shape[1]].contiguous(), attn[:, img_q.shape[1]:].contiguous()
 
-        img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
-        img = img + apply_gate(
-            self.img_mlp(
-                modulate(self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale)
-            ),
-            gate=img_mod2_gate,
-        )
+        img = img + self.img_attn_proj(img_attn) * img_mod1_gate
+        img_mlp_normed = self.img_norm2(img)
+        img_mlp_modulated = img_mlp_normed * (1 + img_mod2_scale) + img_mod2_shift
+        img = img + self.img_mlp(img_mlp_modulated) * img_mod2_gate
 
         txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
         txt = txt + apply_gate(
@@ -313,7 +405,7 @@ class MMSingleStreamBlock(nn.Module):
         
         return x + apply_gate(output, gate=mod_gate)
 
-class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
+class HunyuanVideo_1_5_MotionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin):
     """
     HunyuanVideo Transformer backbone.
 
@@ -523,6 +615,9 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             **factory_kwargs,
         )
 
+        self.action_encoding_init = None
+        self.action_encode_blocks = None
+
         # STA
         if attn_param is None:
             self.attn_param = { 
@@ -559,6 +654,41 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             # 2: vision_encoder feature
         else:
             self.cond_type_embedding = None
+
+    def init_extra_modules_from_config(self, extra_cfg_path: str):
+
+        with open(extra_cfg_path, "r") as f:
+            extra_cfg = json.load(f)
+
+        if self.action_encoding_init is None:
+            cfg = extra_cfg.get("action_encoding_init", {})
+            self.action_encoding_init = ActionEncodingInit(
+                **cfg["input_args"],
+            )
+
+        action_encode_cfg = extra_cfg.get("action_encode_blocks", {})
+        action_encode_input_args = action_encode_cfg.get("input_args", {})
+
+        if self.action_encode_blocks is None:
+            depth = int(action_encode_cfg["depth"])
+            self.action_encode_blocks = nn.ModuleList([
+                ActionSelfAttnBlock(
+                    **action_encode_input_args,
+                )
+                for _ in range(depth)
+            ])
+
+        action_hidden_size = int(action_encode_input_args["hidden_size"])
+        stream_qk_norm = bool(action_encode_input_args["qk_norm"])
+        stream_qk_norm_type = action_encode_input_args["qk_norm_type"]
+        stream_qkv_bias = bool(action_encode_cfg.get("qkv_bias", False))
+        for block in self.double_blocks:
+            block.init_action_cross_attn(
+                action_hidden_size=action_hidden_size,
+                qk_norm=stream_qk_norm,
+                qk_norm_type=stream_qk_norm_type,
+                qkv_bias=stream_qkv_bias,
+            )
 
     def load_hunyuan_state_dict(self, model_path):
         load_key = "module"
@@ -610,7 +740,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         for block in self.single_blocks:
             block.disable_deterministic()
 
-    def get_rotary_pos_embed(self, rope_sizes):
+    def get_rotary_pos_embed_with_h0w0(self, rope_sizes):
         target_ndim = 3
         head_dim = self.hidden_size // self.heads_num
         rope_dim_list = self.rope_dim_list
@@ -626,8 +756,15 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             use_real=True,
             theta_rescale_factor=1,
         )
-        
-        return freqs_cos, freqs_sin
+
+        tt, th, tw = rope_sizes
+        freqs_cos_t = freqs_cos.view(tt, th, tw, -1)[:, 0, 0, :].contiguous()
+        freqs_sin_t = freqs_sin.view(tt, th, tw, -1)[:, 0, 0, :].contiguous()
+        return freqs_cos, freqs_sin, freqs_cos_t, freqs_sin_t
+
+    def slice_rope(self, freqs_cos, freqs_sin, head_dim: int):
+        assert freqs_cos.size(-1) >= head_dim and freqs_sin.size(-1) >= head_dim
+        return freqs_cos[..., :head_dim].contiguous(), freqs_sin[..., :head_dim].contiguous()
 
     def reorder_txt_token(self, byt5_txt, txt, byt5_text_mask, text_mask, zero_feat=False, is_reorder=True):
         if is_reorder:
@@ -668,6 +805,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
     def forward(
         self,
         hidden_states: torch.Tensor,
+        action_states: torch.Tensor,
         timestep: torch.LongTensor,
         text_states: torch.Tensor,
         text_states_2: torch.Tensor,
@@ -676,9 +814,6 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         vision_states: torch.Tensor = None,
         output_features=False,
         output_features_stride=8,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
-        freqs_cos: Optional[torch.Tensor] = None,
-        freqs_sin: Optional[torch.Tensor] = None,
         return_dict: bool = False,
         guidance=None,
         mask_type="t2v",
@@ -701,8 +836,25 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             ow // self.patch_size[2],
         )
         self.attn_param['thw'] = [tt, th, tw]
-        if freqs_cos is None and freqs_sin is None:
-            freqs_cos, freqs_sin = self.get_rotary_pos_embed((tt, th, tw))
+        
+        freqs_cos, freqs_sin, freqs_cos_t, freqs_sin_t = self.get_rotary_pos_embed_with_h0w0((tt, th, tw))
+        freqs_cos_action0 = freqs_cos_t[0:1, :].repeat_interleave(self.action_encoding_init.K, dim=0)  # [T0*1*K, D]
+        freqs_sin_action0 = freqs_sin_t[0:1, :].repeat_interleave(self.action_encoding_init.K, dim=0)  # [T0*1*K, D]
+        freqs_cos_action_rest = freqs_cos_t[1:, :].repeat_interleave(self.action_encoding_init.R*self.action_encoding_init.K, dim=0)  # [(T-1)*R*K, D]
+        freqs_sin_action_rest = freqs_sin_t[1:, :].repeat_interleave(self.action_encoding_init.R*self.action_encoding_init.K, dim=0)  # [(T-1)*R*K, D]
+        freqs_cos_action = torch.cat([freqs_cos_action0, freqs_cos_action_rest], dim=0) # [K+(T-1)*R*K, D]
+        freqs_sin_action = torch.cat([freqs_sin_action0, freqs_sin_action_rest], dim=0) # [K+(T-1)*R*K, D]
+
+        freqs_cos_action_stream, freqs_sin_action_stream = self.slice_rope(
+            freqs_cos_action,
+            freqs_sin_action,
+            self.action_encode_blocks[0].head_dim,
+        )
+        freqs_cos_action_cross, freqs_sin_action_cross = self.slice_rope(
+            freqs_cos_action,
+            freqs_sin_action,
+            self.double_blocks[0].head_dim,
+        )
 
         img = self.img_in(img)
         parallel_dims = get_parallel_state()
@@ -716,6 +868,8 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             img = torch.chunk(img, sp_size, dim=1)[sp_rank]
             freqs_cos = torch.chunk(freqs_cos, sp_size, dim=0)[sp_rank]
             freqs_sin = torch.chunk(freqs_sin, sp_size, dim=0)[sp_rank]
+            # freqs_cos_action_stream = torch.chunk(freqs_cos_action_stream, sp_size, dim=0)[sp_rank]
+            # freqs_sin_action_stream = torch.chunk(freqs_sin_action_stream, sp_size, dim=0)[sp_rank]
 
         # Prepare modulation vectors
         vec = self.time_in(t)
@@ -795,64 +949,60 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
                 extra_encoder_hidden_states, txt, extra_attention_mask, text_mask
             )
 
-        freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
+        if text_mask is not None:   # A temporary patch assuming txt_len for all batches are the same
+            max_txt_len = int(text_mask.bool().sum(dim=1).max().item())
+            txt = txt[:, :max_txt_len, :]
+            text_mask = text_mask[:, :max_txt_len]
+
+        if sp_enabled:
+            txt = torch.chunk(txt, sp_size, dim=1)[sp_rank]
+
+        freqs_cis = (freqs_cos, freqs_sin)
+        freqs_cis_action_stream = (freqs_cos_action_stream, freqs_sin_action_stream)
+        freqs_cis_action_cross = (freqs_cos_action_cross, freqs_sin_action_cross)
 
         features_list = [] if output_features else None
+        
+        with torch.autocast(device_type="cuda", enabled=False):
+            action_states = self.action_encoding_init(action_states.float())
+
+        action_states = action_states.to(dtype=hidden_states.dtype)
+
+        # if sp_enabled:
+        #     action_states = torch.chunk(action_states, sp_size, dim=1)[sp_rank]
+
+        assert action_states.shape[1] == freqs_cos_action_stream.shape[0], (
+            action_states.shape,
+            freqs_cos_action_stream.shape,
+        )
+
+        for index, block in enumerate(self.action_encode_blocks):
+            action_states = block(
+                hidden_states=action_states,
+                freqs_cis_self=freqs_cis_action_stream,
+            )
+
+        # if sp_enabled:
+        #     action_states = all_gather(action_states, dim=1, group=parallel_dims.sp_group)
+
+        assert action_states.shape[1] == freqs_cos_action_cross.shape[0], (
+            action_states.shape,
+            freqs_cos_action_cross.shape,
+        )
 
         # Pass through double-stream blocks
         for index, block in enumerate(self.double_blocks):
-            force_full_attn = (
-                self.attn_mode in ["flex-block-attn"]
-                and self.attn_param["win_type"] == "hybrid"
-                and self.attn_param["win_ratio"] > 0
-                and (
-                    (index + 1) % self.attn_param["win_ratio"] == 0
-                    or (index + 1) == len(self.double_blocks)
-                )
-            )
-            self.attn_param["layer-name"] = f"double_block_{index+1}"
             img, txt = block(
                 img=img,
                 txt=txt,
+                action=action_states,
                 vec=vec,
                 freqs_cis=freqs_cis,
-                text_mask=text_mask,
-                attn_param=self.attn_param,
-                is_flash=force_full_attn,
-                block_idx=index,
+                freqs_cis_action=freqs_cis_action_cross,
+                action_is_fully_gathered=True,
             )
             if output_features and index % output_features_stride == 0:
                 features_list.append(img)
-
-        txt_seq_len = txt.shape[1]
-        img_seq_len = img.shape[1]
-
-        # Merge image and text for single-stream blocks
-        x = torch.cat((img, txt), 1)
-        if len(self.single_blocks) > 0:
-            for index, block in enumerate(self.single_blocks):
-                force_full_attn = (
-                    self.attn_mode in ["flex-block-attn"]
-                    and self.attn_param["win_type"] == "hybrid"
-                    and self.attn_param["win_ratio"] > 0
-                    and (
-                        (index + 1) % self.attn_param["win_ratio"] == 0
-                        or (index + 1) == len(self.single_blocks)
-                    )
-                )
-                self.attn_param["layer-name"] = f"single_block_{index+1}"
-                x = block(
-                    x=x,
-                    vec=vec,
-                    txt_len=txt_seq_len,
-                    freqs_cis=(freqs_cos, freqs_sin),
-                    text_mask=text_mask,
-                    attn_param=self.attn_param,
-                    is_flash=force_full_attn,
-                )
-                if output_features and index % output_features_stride == 0:
-                    features_list.append(x[:, :img_seq_len, ...])
-        img = x[:, :img_seq_len, ...]
 
         # Final Layer
         img = self.final_layer(img, vec)

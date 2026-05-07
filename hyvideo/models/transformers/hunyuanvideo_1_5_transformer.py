@@ -610,7 +610,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         for block in self.single_blocks:
             block.disable_deterministic()
 
-    def get_rotary_pos_embed(self, rope_sizes):
+    def get_rotary_pos_embed_with_h0w0(self, rope_sizes):
         target_ndim = 3
         head_dim = self.hidden_size // self.heads_num
         rope_dim_list = self.rope_dim_list
@@ -626,7 +626,11 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
             use_real=True,
             theta_rescale_factor=1,
         )
-        return freqs_cos, freqs_sin
+
+        tt, th, tw = rope_sizes
+        freqs_cos_t = freqs_cos.view(tt, th, tw, -1)[:, 0, 0, :].contiguous()
+        freqs_sin_t = freqs_sin.view(tt, th, tw, -1)[:, 0, 0, :].contiguous()
+        return freqs_cos, freqs_sin, freqs_cos_t, freqs_sin_t
 
     def reorder_txt_token(self, byt5_txt, txt, byt5_text_mask, text_mask, zero_feat=False, is_reorder=True):
         if is_reorder:
@@ -701,7 +705,7 @@ class HunyuanVideo_1_5_DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapter
         )
         self.attn_param['thw'] = [tt, th, tw]
         if freqs_cos is None and freqs_sin is None:
-            freqs_cos, freqs_sin = self.get_rotary_pos_embed((tt, th, tw))
+            freqs_cos, freqs_sin, freqs_cos_t, freqs_sin_t = self.get_rotary_pos_embed_with_h0w0((tt, th, tw))
 
         img = self.img_in(img)
         parallel_dims = get_parallel_state()

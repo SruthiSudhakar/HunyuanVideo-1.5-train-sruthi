@@ -15,10 +15,22 @@
 # See the License for the specific language governing permissions and limitations under the License.
 
 import os
+from datetime import timedelta
 from dataclasses import dataclass
 
 import torch.distributed as dist
+import torch.distributed.device_mesh as device_mesh
 from torch.distributed.device_mesh import init_device_mesh
+
+
+DEFAULT_PROCESS_GROUP_TIMEOUT = timedelta(minutes=120)
+_ORIGINAL_DEVICE_MESH_NEW_GROUP = device_mesh.new_group
+
+
+def _new_group_with_default_timeout(*args, **kwargs):
+    if kwargs.get("timeout") is None:
+        kwargs["timeout"] = DEFAULT_PROCESS_GROUP_TIMEOUT
+    return _ORIGINAL_DEVICE_MESH_NEW_GROUP(*args, **kwargs)
 
 @dataclass
 class ParallelDims:
@@ -32,6 +44,14 @@ class ParallelDims:
                 self.world_size = dist.get_world_size()
             else:
                 self.world_size = int(os.getenv("WORLD_SIZE", "1"))
+        if self.world_size > 1 and not dist.is_initialized():
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                timeout=DEFAULT_PROCESS_GROUP_TIMEOUT,
+            )
+        if device_mesh.new_group is not _new_group_with_default_timeout:
+            device_mesh.new_group = _new_group_with_default_timeout
         self.build_mesh("cuda")
 
     def build_mesh(self, device_type):
