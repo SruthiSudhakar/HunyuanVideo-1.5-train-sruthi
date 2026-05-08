@@ -22,7 +22,7 @@ mkdir -p new_requests inbox_done inbox_errors outputs/generated_videos
 torchrun --standalone --nproc_per_node=8 serve.py \
 --model_path ckpts \
 --transformer_version 480p_i2v \
---checkpoint_path outputs/decoder_batch_32_lora_r64_jdg_largescale/checkpoint-2000 \
+--checkpoint_path /proj/vondrick3/HunyuanVideo-1.5-train-sruthi/outputs/decoder_batch_32_lora_r64_jdg_largescale_moredata/checkpoint-1500 \
 --inbox_dir new_requests --done_dir inbox_done --error_dir inbox_errors --output_dir outputs/generated_videos \
 --video_length 33 --video_width 848 --video_height 480 --video_spatial_crop_margin 40 \
 --target_resolution 480p --num_inference_steps 10 --guidance_scale 1.0 --seed 42 \
