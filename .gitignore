@@ -172,3 +172,4 @@ hyvideo/utils/rewrite/i2v_env.sh
 
 inbox_done/
 new_requests/
+inbox_errors/

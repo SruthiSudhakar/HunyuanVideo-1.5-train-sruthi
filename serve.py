@@ -4,10 +4,15 @@
 """Long-running variant of generate.py.
 
 Loads the HunyuanVideo-1.5 pipeline once, then watches an inbox directory for new
-`.npy` request manifests (same format as generate.py). Each manifest triggers
-one forward_motion_generator call; outputs land in --output_dir, processed
-manifests + their referenced images are moved to --done_dir (or --error_dir on
-failure).
+`.npy` request manifests. Each manifest triggers one or more batched
+forward_motion_generator calls; N output mp4s land under
+`<output_dir>/<name>/<k>.mp4`, processed manifests + their referenced images
+move to --done_dir (or --error_dir on failure).
+
+Manifest format (pickled dict, np.save with allow_pickle=True):
+    image_paths : np.array of [T] strings (basename or path resolved relative to manifest dir)
+    trajectory  : np.array, either [T, 7] (single chunk) or [N, T, 7] (N batched chunks)
+                  T must be 4n+1 and ≤ --video_length; all N chunks share the same T.
 
 Usage:
 conda activate hunyuan15
@@ -23,10 +28,7 @@ torchrun --standalone --nproc_per_node=8 serve.py \
 --target_resolution 480p --num_inference_steps 10 --guidance_scale 1.0 --seed 42 \
 --dtype bf16 --sp_size 8 \
 --offloading false --group_offloading false --overlap_group_offloading false \
---poll_interval 1.0                                                                                                  
-                                                         
-  Same args as the deleted launcher; tweak --num_inference_steps (drop to 20 for faster turnaround) or --nproc_per_node /
-
+--poll_interval 1.0 --max_batch_size 4
 """
 
 import argparse
@@ -43,66 +45,112 @@ os.environ.setdefault("LOCAL_RANK", "0")
 os.environ.setdefault("MASTER_ADDR", "localhost")
 os.environ.setdefault("MASTER_PORT", "29500")
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
 from generate import (
+    ACTION_JOINT_COUNT,
+    ACTION_STATE_DIM,
     build_pipeline,
     first_frame_to_image,
-    load_sample,
+    load_action_manifest,
+    load_video,
     log,
     rank0,
     resolve_manifest_image_paths,
+    sample_temporal_window,
     save_video,
     str_to_bool,
 )
 from hyvideo.commons.parallel_states import initialize_parallel_state
 
 
-def process_one(pipe, manifest_path: Path, request_idx: int, output_dir: Path, args):
-    sample_name = manifest_path.stem
-    log(f"[serve] processing {request_idx:04d} ({sample_name})")
+def load_request(manifest_path: Path, request_idx: int, args):
+    """Load a request manifest and prepare it for batched generation.
 
-    sample = load_sample(manifest_path, request_idx, args)
-    reference_image, original_video = first_frame_to_image(sample["pixel_values"])
-    action_states = sample["action_states"]
-    video_length = int(action_states.shape[0])
-    height = int(original_video.shape[-2])
-    width = int(original_video.shape[-1])
-    prompt = args.prompt if args.prompt is not None else str(sample.get("text", ""))
+    Returns dict with:
+        reference_image : PIL.Image      — single conditioning frame
+        action_states   : torch.Tensor   — shape [N, T, 1, 7], float32
+        name            : str            — manifest stem, used for the output subdir
+    """
+    seq_data = load_action_manifest(manifest_path)
+    start_frame_idx, num_frames = sample_temporal_window(manifest_path, request_idx, args)
+    pixel_values = load_video(manifest_path, start_frame_idx, num_frames, request_idx, args)
+    reference_image, _ = first_frame_to_image(pixel_values)
 
-    with torch.no_grad():
-        output = pipe.forward_motion_generator(
-            prompt=prompt,
-            aspect_ratio=f"{width}:{height}",
-            reference_image=reference_image,
-            action_states=action_states,
-            video_length=video_length,
-            enable_sr=False,
-            prompt_rewrite=False,
-            seed=args.seed + request_idx,
-            guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps,
-            target_resolution=args.target_resolution,
+    trajectory = np.asarray(seq_data["trajectory"], dtype=np.float64)
+    if trajectory.ndim == 2:
+        if trajectory.shape[1] != ACTION_STATE_DIM:
+            raise ValueError(f"trajectory[T, D] expected D={ACTION_STATE_DIM}, got {trajectory.shape}")
+        trajectory = trajectory[None, :, None, :]
+    elif trajectory.ndim == 3:
+        if trajectory.shape[2] != ACTION_STATE_DIM:
+            raise ValueError(f"trajectory[N, T, D] expected D={ACTION_STATE_DIM}, got {trajectory.shape}")
+        trajectory = trajectory[:, :, None, :]
+    else:
+        raise ValueError(f"trajectory must be 2D [T,7] or 3D [N,T,7], got shape {trajectory.shape}")
+
+    if trajectory.shape[2] != ACTION_JOINT_COUNT or trajectory.shape[3] != ACTION_STATE_DIM:
+        raise ValueError(f"trajectory shape after expansion: expected [N,T,1,7], got {trajectory.shape}")
+
+    end_frame_idx = start_frame_idx + num_frames
+    if trajectory.shape[1] < end_frame_idx:
+        raise ValueError(
+            f"trajectory T={trajectory.shape[1]} too short for window [{start_frame_idx},{end_frame_idx})"
         )
+    trajectory = trajectory[:, start_frame_idx:end_frame_idx, :, :]
 
+    return {
+        "reference_image": reference_image,
+        "action_states": torch.from_numpy(trajectory.astype(np.float32)),
+        "name": manifest_path.stem,
+    }
+
+
+def process_request(pipe, request, request_idx: int, output_dir: Path, args):
+    name = request["name"]
+    reference_image = request["reference_image"]
+    action_states = request["action_states"]  # [N, T, 1, 7]
+    N = int(action_states.shape[0])
+    T = int(action_states.shape[1])
+    width, height = reference_image.size  # PIL: (W, H)
+    log(f"[serve] processing {request_idx:04d} ({name}): N={N} chunks, T={T} frames")
+
+    out_subdir = output_dir / name
     if rank0():
-        generated_video = output.videos[0].detach().cpu().float().clamp(0, 1)
-        original_video_norm = ((original_video.detach().cpu().float().clamp(-1, 1) + 1.0) * 0.5).clamp(0, 1)
+        out_subdir.mkdir(parents=True, exist_ok=True)
 
-        if original_video_norm.shape[1] != generated_video.shape[1]:
-            common_frames = min(original_video_norm.shape[1], generated_video.shape[1])
-            original_video_norm = original_video_norm[:, :common_frames]
-            generated_video = generated_video[:, :common_frames]
+    cap = max(1, int(args.max_batch_size))
+    for chunk_start in range(0, N, cap):
+        chunk_end = min(N, chunk_start + cap)
+        B = chunk_end - chunk_start
+        log(f"[serve] forward {chunk_start}:{chunk_end} (B={B})")
 
-        generated_path = output_dir / f"{request_idx:04d}_{sample_name}_generated.mp4"
-        comparison_path = output_dir / f"{request_idx:04d}_{sample_name}_comparison.mp4"
-        save_video(generated_video, generated_path)
-        save_video(torch.cat([original_video_norm, generated_video], dim=-1), comparison_path)
-        log(f"[serve] saved {generated_path.name}")
+        with torch.no_grad():
+            output = pipe.forward_motion_generator(
+                prompt=[""] * B,
+                aspect_ratio=f"{width}:{height}",
+                reference_image=reference_image,
+                action_states=action_states[chunk_start:chunk_end],
+                video_length=T,
+                enable_sr=False,
+                prompt_rewrite=False,
+                seed=args.seed + request_idx * 1000 + chunk_start,
+                guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps,
+                target_resolution=args.target_resolution,
+            )
 
-    if dist.is_initialized():
-        dist.barrier()
+        if rank0():
+            videos = output.videos.detach().cpu().float().clamp(0, 1)
+            for i in range(B):
+                k = chunk_start + i
+                save_video(videos[i], out_subdir / f"{k}.mp4")
+                log(f"[serve] saved {name}/{k}.mp4")
+
+        if dist.is_initialized():
+            dist.barrier()
 
 
 def archive_artifacts(manifest_path: Path, dst_dir: Path):
@@ -151,7 +199,8 @@ def serve(args):
             manifests = sorted(inbox.glob("*.npy"), key=lambda p: p.stat().st_mtime)
             for manifest_path in manifests:
                 try:
-                    process_one(pipe, manifest_path, request_idx, output_dir, args)
+                    request = load_request(manifest_path, request_idx, args)
+                    process_request(pipe, request, request_idx, output_dir, args)
                     archive_artifacts(manifest_path, done_dir)
                 except Exception as e:
                     log(f"[serve] ERROR on {manifest_path.name}: {e!r}")
@@ -178,6 +227,8 @@ def main():
     parser.add_argument("--error_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--poll_interval", type=float, default=1.0)
+    parser.add_argument("--max_batch_size", type=int, default=4,
+                        help="cap on B per forward call; N>cap is auto-chunked")
     # generation knobs (immutable per server invocation)
     parser.add_argument("--video_length", type=int, default=33)
     parser.add_argument("--video_width", type=int, default=848)

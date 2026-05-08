@@ -362,6 +362,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 input_image_np = resize_and_center_crop(reference_image, target_width=width, target_height=height)
                 vision_states = self.vision_encoder.encode_images(input_image_np)
                 vision_states = vision_states.last_hidden_state.to(device=device, dtype=self.target_dtype)
+                # Replicate to match latents batch dim so 1 reference image
+                # broadcasts to N action chunks at inference (matches t2v branch above).
+                if vision_states.shape[0] == 1 and latents.shape[0] > 1:
+                    vision_states = vision_states.expand(latents.shape[0], -1, -1).contiguous()
             else:
                 vision_states = None
         
@@ -390,7 +394,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         mask_concat = None
         
         if cond_latents is not None and task_type == 'i2v':
-            latents_concat = cond_latents.repeat(1, 1, latents.shape[2], 1, 1)
+            # Replicate cond_latents along batch dim so 1 reference image
+            # broadcasts to N action chunks at inference. Matches the t2v branch's
+            # use of latents.shape[0] below.
+            latents_concat = cond_latents.repeat(latents.shape[0], 1, latents.shape[2], 1, 1)
             latents_concat[:, :, 1:, :, :] = 0.0
         else:
             latents_concat = torch.zeros(latents.shape[0], latents.shape[1], latents.shape[2], latents.shape[3], latents.shape[4]).to(latents.device)
