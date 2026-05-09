@@ -17,21 +17,23 @@ Manifest format (pickled dict, np.save with allow_pickle=True):
 Usage:
 conda activate hunyuan15
 cd /proj/vondrick3/HunyuanVideo-1.5-train-sruthi
-mkdir -p new_requests inbox_done inbox_errors outputs/generated_videos
+mkdir -p new_requests inbox_done inbox_errors outputs/generated_videos rank_inbox rank_done rank_errors
 
 torchrun --standalone --nproc_per_node=8 serve.py \
 --model_path ckpts \
 --transformer_version 480p_i2v \
---checkpoint_path /proj/vondrick3/HunyuanVideo-1.5-train-sruthi/outputs/decoder_batch_32_lora_r64_jdg_largescale_moredata/checkpoint-1500 \
+--checkpoint_path /proj/vondrick3/HunyuanVideo-1.5-train-sruthi/outputs/decoder_batch_32_lora_r64_jdg_largescale_moredata_v2/checkpoint-1000 \
 --inbox_dir new_requests --done_dir inbox_done --error_dir inbox_errors --output_dir outputs/generated_videos \
 --video_length 33 --video_width 848 --video_height 480 --video_spatial_crop_margin 40 \
 --target_resolution 480p --num_inference_steps 10 --guidance_scale 1.0 --seed 42 \
 --dtype bf16 --sp_size 8 \
 --offloading false --group_offloading false --overlap_group_offloading false \
---poll_interval 1.0 --max_batch_size 4
+--poll_interval 1.0 --max_batch_size 4 \
+--rank_inbox_dir rank_inbox
 """
 
 import argparse
+import json
 import os
 import shutil
 import time
@@ -108,6 +110,33 @@ def load_request(manifest_path: Path, request_idx: int, args):
     }
 
 
+def enqueue_rank_job(out_subdir: Path, name: str, n_videos: int, rank_inbox_dir: str):
+    """Atomically publish a small JSON job to rank_inbox_dir for the ranker server.
+
+    Skipped silently when ranking is disabled (empty dir), when not on rank 0,
+    or when N != 4 (rank_videos requires exactly 4).
+    """
+    if not rank_inbox_dir or not rank0():
+        return
+    if n_videos != 4:
+        log(f"[serve] skip rank job for {name}: N={n_videos} (ranker requires 4)")
+        return
+    inbox = Path(rank_inbox_dir)
+    inbox.mkdir(parents=True, exist_ok=True)
+    paths = [str((out_subdir / f"{k}.mp4").resolve()) for k in range(4)]
+    job = {
+        "name": name,
+        "output_subdir": str(out_subdir.resolve()),
+        "video_paths": paths,
+        "task_name": "PnPRedLegoToBrownBowl",
+    }
+    tmp = inbox / f".{name}.json.tmp"
+    final = inbox / f"{name}.json"
+    tmp.write_text(json.dumps(job, indent=2))
+    tmp.rename(final)
+    log(f"[serve] enqueued rank job {final}")
+
+
 def process_request(pipe, request, request_idx: int, output_dir: Path, args):
     name = request["name"]
     reference_image = request["reference_image"]
@@ -151,6 +180,8 @@ def process_request(pipe, request, request_idx: int, output_dir: Path, args):
 
         if dist.is_initialized():
             dist.barrier()
+
+    enqueue_rank_job(out_subdir, name, N, args.rank_inbox_dir)
 
 
 def archive_artifacts(manifest_path: Path, dst_dir: Path):
@@ -226,6 +257,9 @@ def main():
     parser.add_argument("--done_dir", type=str, required=True)
     parser.add_argument("--error_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--rank_inbox_dir", type=str, default="",
+                        help="If set, enqueue a JSON job here after each request for the ranker server. "
+                             "Empty string disables ranking integration.")
     parser.add_argument("--poll_interval", type=float, default=1.0)
     parser.add_argument("--max_batch_size", type=int, default=4,
                         help="cap on B per forward call; N>cap is auto-chunked")

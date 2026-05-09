@@ -173,3 +173,6 @@ hyvideo/utils/rewrite/i2v_env.sh
 inbox_done/
 new_requests/
 inbox_errors/
+rank_inbox/
+rank_done/
+rank_errors/
