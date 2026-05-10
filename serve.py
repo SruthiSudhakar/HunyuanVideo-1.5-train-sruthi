@@ -114,16 +114,16 @@ def enqueue_rank_job(out_subdir: Path, name: str, n_videos: int, rank_inbox_dir:
     """Atomically publish a small JSON job to rank_inbox_dir for the ranker server.
 
     Skipped silently when ranking is disabled (empty dir), when not on rank 0,
-    or when N != 4 (rank_videos requires exactly 4).
+    or when N < 2 (ranker requires at least 2 videos to do pairwise comparisons).
     """
     if not rank_inbox_dir or not rank0():
         return
-    if n_videos != 4:
-        log(f"[serve] skip rank job for {name}: N={n_videos} (ranker requires 4)")
+    if n_videos < 2:
+        log(f"[serve] skip rank job for {name}: N={n_videos} (ranker requires >=2)")
         return
     inbox = Path(rank_inbox_dir)
     inbox.mkdir(parents=True, exist_ok=True)
-    paths = [str((out_subdir / f"{k}.mp4").resolve()) for k in range(4)]
+    paths = [str((out_subdir / f"{k}.mp4").resolve()) for k in range(n_videos)]
     job = {
         "name": name,
         "output_subdir": str(out_subdir.resolve()),
